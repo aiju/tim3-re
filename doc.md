@@ -151,6 +151,19 @@
   - `g_partPickFilter` (0x481018) — 0=all, 1=belt-connectable (flags2 & 0x04), 2=rope-connectable (flags2 & 0x01)
   - `g_secondaryPickedPart` (0x480fb0) — runner-up Part* from `findPartAtCursor`
   - `g_beltAnchorPart` (0x480904) — Part* being connected from during belt placement
+- **Part removal:**
+  - `deleteSelectedPart` — removes `g_selectedPart` with type-specific handling: disconnects ropes/belts, removes Remote Control paired explosives, returns generic parts to bin
+  - `cleanupAndFreeRemovedPart` — cascade cleanup for part in fg layer: disconnects attachments, ropes, rewires pulleys (bypasses removed pulley), removes belt connections, then `freePartIfPuzzleMode`
+  - `returnPartToBin(part)` — disconnects part's connections, clears placed flags (0x8000 from flags1, 0x40 from flags2), unlinks from current layer, reinserts sorted into `g_fgPartList`
+  - `freePartIfPuzzleMode(part)` — in puzzle/tutorial mode (or type 0x37 Explosives): unlinks and frees; otherwise just clears `g_selectedPart` if it matches
+  - `removeFromPartOrder_MAYBE` — removes selected part from puzzle placement queue (shifts array entries up)
+  - `disconnectBeltConnections(part, propagate)` — tears down both belt connection slots; if propagate=1, also disconnects the remote endpoint and clears pulley chains
+  - `disconnectAttachment(part)` — disconnects plug/socket connections (flags3 & 3): for sockets (bit 1), detaches from `connectedParts[0]` and re-inits both parts; for plugs (bit 2), detaches from slots 4–6
+- **Overlap detection:**
+  - `isPartOverlappingOthers(part)` → int — checks if part overlaps any existing part on bg+physics layers; skips self, exempt pairs, and parts with flags2 & 0x2000 or flags3 & 0x5000
+  - `canTypesOverlap(type_a, type_b)` → int — whitelist of type pairs allowed to coexist: {0xc,0x2a}, {0xc,0x34}, {0x2a,0x34}, {0x2a,0x2a}, {0x36,0x36}, {0x36,0x3a}
+  - `doPolygonsIntersect(part_a, part_b)` → int — edge-by-edge polygon intersection test using shape data at Part+0xd8
+  - `doLineSegmentsIntersect(seg1, seg2, out_pt)` → int — line segment intersection via cross-product; `isValueBetween(val, a, b)` — range check helper
   - `setHandleCursor(cursor_id)` — sets cursor appearance for current handle; `g_handleCursorType` (0x477968)
   - `updatePulleyOrientation(part)` — computes angles to both `connectedParts`, averages them, sets quadrant (0-3) as frame + `connPointOffsets`
   - `reorientConnectedPulleys(part)` — updates pulley orientation for part and its connectedParts
@@ -298,6 +311,13 @@
 - `confirmH2hPlacement(part)` — moves part from pending to placed when confirmed
 - `g_h2hPlacedPart` (0x4815b8) — Part* successfully placed this turn (cleared on sim/turn end)
 - `g_h2hPendingPart` (0x4815c0) — Part* currently being placed by current player
+- `updateH2hTurn` — checks timer expiry, switches player, resets deadline, shows turn dialog
+- `h2hForceDropSelectedPart` — on timer expiry, forces player to give up the held part:
+  - Connection parts (Belt, Rope, Steel Cable) and paired parts (Remote Control + Explosives): deleted outright (incomplete state)
+  - Parts being placed (editMode 9) that overlap: deleted
+  - Parts being placed that don't overlap: dropped in place via forced button-up
+  - Parts being dragged (editMode & 0x8000): forced button-up cancels drag
+  - Clears `g_selectedPart` in all cases
 
 ### Puzzle System
 - **Save file** — `TIM.SAV`, loaded by `loadPuzzleState`, written by `savePuzzleState`
@@ -394,6 +414,7 @@
   - `g_iconBitmaps` (0x47df80) — `int[10]` bitmap handles
   - `getPartTypeIcon(type_id)` → BitmapFrame* — indexes into atlases by type ID; pass -1 to release all
   - `drawPartIconAtCursor` — draws selected part's icon centered on cursor (called when `g_cursorIconCountdown > 0`)
+  - `layoutPartBin(reset_scroll)` — rebuilds part bin layout: iterates available parts, filters by `g_selectedCategory`, positions icons in rows/columns, sets scroll ranges; reset_scroll=1 resets scroll position
 - **Part descriptions** — tooltip system for hotspot hover
   - `initPartDescriptions` / `shutdownPartDescriptions` — ref-counted init, loads `DESCRIPT.PFT`/`BMP`/`RES`
   - `descriptionDrawCallback(hotspot)` — draws tooltip bubble with bitmap + text from DESCRIPT.RES (string group 5001)

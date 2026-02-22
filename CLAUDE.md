@@ -33,7 +33,7 @@
 
 ## Documentation
 
-- **doc.md** — accumulated reverse engineering notes (architecture, structs, subsystem docs). Consult when exploring unfamiliar code areas.
+- **doc.md** — accumulated reverse engineering notes (architecture, structs, subsystem docs). Consult when exploring unfamiliar code areas. These are best-effort guesses from ongoing RE work, not authoritative — always verify against the actual binary before relying on them.
 
 ## res-extract Tool
 
