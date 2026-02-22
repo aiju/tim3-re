@@ -1,9 +1,13 @@
 #![allow(dead_code)]
 
 use anyhow::{bail, Context, Result};
-use iced_x86::{Decoder, DecoderOptions, Formatter, FormatterOutput, FormatterTextKind, Instruction, MasmFormatter};
+use iced_x86::{CC_e, CC_ne, Decoder, DecoderOptions, Formatter, FormatterOutput,
+    FormatterTextKind, Instruction, MasmFormatter, SymbolResolver, SymbolResult};
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::BufRead;
 
 // --- Raw record splitting ---
 
@@ -632,6 +636,142 @@ impl OmfModule {
         buf
     }
 
+    /// Compute base addresses for each segment using PUBDEF symbols + symbol table.
+    fn segment_bases(&self, records: &[Record], symbols: &SymbolTable) -> HashMap<usize, u64> {
+        let mut bases = HashMap::new();
+        for rec in records {
+            if let Record::Pubdef { seg_idx, symbols: syms, .. } = rec {
+                if bases.contains_key(seg_idx) {
+                    continue;
+                }
+                for sym in syms {
+                    if let Some(addr) = symbols.lookup_name(&sym.name) {
+                        bases.insert(*seg_idx, addr - sym.offset as u64);
+                        break;
+                    }
+                }
+            }
+        }
+        bases
+    }
+
+    /// Apply fixups to segment data using symbol table for address resolution.
+    fn apply_fixups(
+        &self,
+        seg_idx: usize,
+        buf: &mut [u8],
+        records: &[Record],
+        symbols: &SymbolTable,
+        seg_bases: &HashMap<usize, u64>,
+    ) {
+        let seg_base = seg_bases.get(&seg_idx).copied().unwrap_or(0);
+
+        // walk records: track last LEDATA, apply following FIXUPPs
+        let mut last_ledata: Option<(usize, u32)> = None; // (seg_idx, offset)
+        for rec in records {
+            match rec {
+                Record::Ledata { seg_idx: si, offset, .. } => {
+                    last_ledata = Some((*si, *offset));
+                }
+                Record::Fixupp { fixups, threads, is32 } => {
+                    let Some((le_seg, le_offset)) = last_ledata else { continue };
+                    if le_seg != seg_idx { continue; }
+
+                    // build thread tables for this FIXUPP record
+                    let mut target_threads: [Option<(u8, usize)>; 4] = [None; 4];
+                    for t in threads {
+                        if !t.is_frame {
+                            target_threads[t.thread_num as usize] = Some((t.method, t.index));
+                        }
+                    }
+
+                    for f in fixups {
+                        // resolve target method and datum
+                        let (tgt_method, tgt_datum) = if f.target_via_thread {
+                            match target_threads[f.target_method as usize] {
+                                Some(v) => v,
+                                None => continue,
+                            }
+                        } else {
+                            (f.target_method, f.target_datum)
+                        };
+
+                        // resolve target to absolute address
+                        let target_addr = match tgt_method & 0x03 {
+                            0 => {
+                                // segment + displacement
+                                let tgt_base = seg_bases.get(&tgt_datum).copied().unwrap_or(0);
+                                tgt_base + f.displacement as u64
+                            }
+                            1 => {
+                                // group + displacement — use first segment in group
+                                if let Some(grp) = self.groups.get(tgt_datum.wrapping_sub(1)) {
+                                    let first_seg = grp.segs.first().copied().unwrap_or(0);
+                                    let tgt_base = seg_bases.get(&first_seg).copied().unwrap_or(0);
+                                    tgt_base + f.displacement as u64
+                                } else {
+                                    continue;
+                                }
+                            }
+                            2 => {
+                                // external — look up by name
+                                let ext_name = match self.extdefs.get(tgt_datum.wrapping_sub(1)) {
+                                    Some(n) => n.as_str(),
+                                    None => continue,
+                                };
+                                match symbols.lookup_name(ext_name) {
+                                    Some(addr) => addr + f.displacement as u64,
+                                    None => continue,
+                                }
+                            }
+                            _ => continue,
+                        };
+
+                        // compute patch location in segment buffer
+                        let patch_offset = le_offset as usize + f.data_offset as usize;
+                        let patch_size = match f.location_type {
+                            1 | 5 => 2,      // offset16
+                            9 | 13 => 4,     // offset32
+                            _ => continue,    // skip unsupported types for now
+                        };
+                        if patch_offset + patch_size > buf.len() {
+                            continue;
+                        }
+
+                        // compute patched value
+                        let value = if f.is_seg_relative {
+                            // direct/absolute: value is the target address
+                            target_addr
+                        } else {
+                            // self-relative: value = target - (patch_location + patch_size)
+                            let fixup_addr = seg_base + patch_offset as u64;
+                            target_addr.wrapping_sub(fixup_addr + patch_size as u64)
+                        };
+
+                        // write
+                        match patch_size {
+                            2 => {
+                                let bytes = (value as u16).to_le_bytes();
+                                buf[patch_offset..patch_offset + 2].copy_from_slice(&bytes);
+                            }
+                            4 => {
+                                let bytes = (value as u32).to_le_bytes();
+                                buf[patch_offset..patch_offset + 4].copy_from_slice(&bytes);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {
+                    // non-LEDATA/FIXUPP clears the LEDATA context
+                    if !matches!(rec, Record::Fixupp { .. }) {
+                        last_ledata = None;
+                    }
+                }
+            }
+        }
+    }
+
     /// Find a public symbol by name. Returns (seg_idx, offset).
     fn find_pubsym(&self, name: &str, records: &[Record]) -> Option<(usize, u32)> {
         for rec in records {
@@ -794,7 +934,7 @@ fn dump_record(raw: &RawRecord, rec: &Record, rec_index: usize, module: &OmfModu
                 }
             }
             for f in fixups {
-                let rel = if f.is_seg_relative { "self-rel" } else { "direct" };
+                let rel = if f.is_seg_relative { "direct" } else { "self-rel" };
                 let target = if f.target_via_thread {
                     match target_threads[f.target_method as usize] {
                         Some((method, datum)) => module.fixup_target_label(method, datum),
@@ -832,23 +972,92 @@ fn dump_record(raw: &RawRecord, rec: &Record, rec_index: usize, module: &OmfModu
 
 // --- Commands ---
 
-struct UppercaseOutput(String);
+struct UppercaseOutput {
+    s: String,
+    uppercase_keywords: bool,
+}
+
+impl UppercaseOutput {
+    fn new(uppercase_keywords: bool) -> Self {
+        Self { s: String::new(), uppercase_keywords }
+    }
+}
 
 impl FormatterOutput for UppercaseOutput {
     fn write(&mut self, text: &str, kind: FormatterTextKind) {
         match kind {
-            FormatterTextKind::Mnemonic | FormatterTextKind::Register | FormatterTextKind::Keyword => {
-                self.0.push_str(&text.to_uppercase());
+            FormatterTextKind::Mnemonic | FormatterTextKind::Register => {
+                self.s.push_str(&text.to_uppercase());
             }
-            _ => self.0.push_str(text),
+            FormatterTextKind::Keyword => {
+                if self.uppercase_keywords {
+                    self.s.push_str(&text.to_uppercase());
+                } else {
+                    self.s.push_str(text);
+                }
+            }
+            _ => self.s.push_str(text),
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct SymbolEntry {
+    address: String,
+    name: String,
+}
+
+struct SymbolTable {
+    by_address: HashMap<u64, String>,
+    by_name: HashMap<String, u64>,
+}
+
+impl SymbolTable {
+    fn load(path: &str) -> Result<SymbolTable> {
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path}"))?;
+        let reader = std::io::BufReader::new(file);
+        let mut by_address = HashMap::new();
+        let mut by_name = HashMap::new();
+        for line in reader.lines() {
+            let line = line?;
+            if line.is_empty() { continue; }
+            let entry: SymbolEntry = serde_json::from_str(&line)
+                .with_context(|| format!("failed to parse symbol entry"))?;
+            let addr = u64::from_str_radix(&entry.address, 16)
+                .with_context(|| format!("bad address: {}", entry.address))?;
+            by_address.insert(addr, entry.name.clone());
+            by_name.insert(entry.name, addr);
+        }
+        Ok(SymbolTable { by_address, by_name })
+    }
+
+    /// Look up an OBJ symbol name in the Ghidra symbol table.
+    /// Tries: exact match, strip leading `_`, and DLL::Name suffix match.
+    fn lookup_name(&self, obj_name: &str) -> Option<u64> {
+        if let Some(&addr) = self.by_name.get(obj_name) {
+            return Some(addr);
+        }
+        // Borland C prepends _ to __cdecl symbols
+        if let Some(stripped) = obj_name.strip_prefix('_') {
+            if let Some(&addr) = self.by_name.get(stripped) {
+                return Some(addr);
+            }
+        }
+        // Win32 imports: Ghidra uses "DLL::FuncName" format
+        let suffix = format!("::{obj_name}");
+        for (name, &addr) in &self.by_name {
+            if name.ends_with(&suffix) {
+                return Some(addr);
+            }
+        }
+        None
     }
 }
 
 fn usage() -> ! {
     eprintln!("usage: obj-extract <command> [args...]");
-    eprintln!("  dump <file>             dump all OMF records");
-    eprintln!("  disasm <file> <symbol>  disassemble a function");
+    eprintln!("  dump <file>                                 dump all OMF records");
+    eprintln!("  disasm [--with-symbols <symfile>] [--compact] <file> <symbol>  disassemble a function");
     std::process::exit(1);
 }
 
@@ -860,14 +1069,45 @@ fn load_module(path: &str) -> Result<(Vec<RawRecord>, Vec<Record>, OmfModule)> {
     Ok((raws, records, module))
 }
 
-fn cmd_disasm(path: &str, symbol_name: &str) -> Result<()> {
+/// Pad absolute memory addresses like [0x490eec] to [0x00490eec] (8 hex digits).
+/// Only pads addresses that appear as bare [0xNNN] (no register base).
+fn pad_absolute_addrs(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(idx) = rest.find("[0x") {
+        // Check this is a bare address: the char before 0x should be '['
+        result.push_str(&rest[..idx + 1]); // include the '['
+        rest = &rest[idx + 1..];
+        // rest now starts with "0x..."
+        // extract the hex digits after "0x"
+        let hex_start = 2; // skip "0x"
+        let hex_end = rest[hex_start..].find(|c: char| !c.is_ascii_hexdigit())
+            .map(|i| i + hex_start)
+            .unwrap_or(rest.len());
+        let hex_digits = &rest[hex_start..hex_end];
+        if hex_digits.len() < 8 {
+            result.push_str("0x");
+            for _ in 0..(8 - hex_digits.len()) {
+                result.push('0');
+            }
+            result.push_str(hex_digits);
+        } else {
+            result.push_str(&rest[..hex_end]);
+        }
+        rest = &rest[hex_end..];
+    }
+    result.push_str(rest);
+    result
+}
+
+fn cmd_disasm(path: &str, symbol_name: &str, sym_file: Option<&str>, compact: bool) -> Result<()> {
     let (_raws, records, module) = load_module(path)?;
 
     let (seg_idx, sym_offset) = module
         .find_pubsym(symbol_name, &records)
         .ok_or_else(|| anyhow::anyhow!("symbol not found: {symbol_name}"))?;
 
-    let seg_data = module.segment_data(seg_idx, &records);
+    let mut seg_data = module.segment_data(seg_idx, &records);
     let syms = module.segment_symbols(seg_idx, &records);
 
     // find function end: next symbol after this one, or end of segment data
@@ -877,6 +1117,27 @@ fn cmd_disasm(path: &str, symbol_name: &str) -> Result<()> {
         .map(|&(_, off)| off)
         .unwrap_or(seg_data.len() as u32);
 
+    // load symbol table and find base address
+    let symbols = match sym_file {
+        Some(f) => Some(SymbolTable::load(f)?),
+        None => None,
+    };
+    let base_addr: u64 = match &symbols {
+        Some(st) => {
+            st.lookup_name(symbol_name)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "{symbol_name} not found in symbol table"
+                ))?
+        }
+        None => sym_offset as u64,
+    };
+
+    // apply fixups if we have a symbol table
+    if let Some(ref st) = symbols {
+        let seg_bases = module.segment_bases(&records, st);
+        module.apply_fixups(seg_idx, &mut seg_data, &records, st, &seg_bases);
+    }
+
     let start = sym_offset as usize;
     let end = func_end as usize;
     if start >= seg_data.len() {
@@ -884,52 +1145,118 @@ fn cmd_disasm(path: &str, symbol_name: &str) -> Result<()> {
     }
     let code = &seg_data[start..end.min(seg_data.len())];
 
-    println!("{symbol_name}:");
-    let mut decoder = Decoder::with_ip(32, code, sym_offset as u64, DecoderOptions::NONE);
-    let mut formatter = MasmFormatter::new();
+    if !compact {
+        println!("{symbol_name}:");
+    }
+    let ip_start = base_addr;
+    let mut decoder = Decoder::with_ip(32, code, ip_start, DecoderOptions::NONE);
+
+    let resolver: Option<Box<dyn SymbolResolver>> = if compact {
+        None
+    } else {
+        match &symbols {
+            Some(st) => {
+                // SymbolResolver needs 'static, so we build an owned lookup table
+                let owned: HashMap<u64, String> = st.by_address.clone();
+                Some(Box::new(OwnedSymbolResolver { symbols: owned }))
+            }
+            None => None,
+        }
+    };
+
+    let mut formatter = MasmFormatter::with_options(resolver, None);
     formatter.options_mut().set_uppercase_mnemonics(true);
     formatter.options_mut().set_uppercase_registers(true);
-    formatter.options_mut().set_uppercase_keywords(true);
-    formatter.options_mut().set_uppercase_all(true);
     formatter.options_mut().set_space_after_operand_separator(false);
+    if compact {
+        // Ghidra-style: 0x prefix, lowercase hex digits, lowercase keywords,
+        // spaces in memory operands, no branch size hints
+        formatter.options_mut().set_uppercase_keywords(false);
+        formatter.options_mut().set_uppercase_hex(false);
+        formatter.options_mut().set_hex_prefix("0x");
+        formatter.options_mut().set_hex_suffix("");
+        formatter.options_mut().set_space_between_memory_add_operators(true);
+        formatter.options_mut().set_space_between_memory_mul_operators(true);
+        formatter.options_mut().set_show_branch_size(false);
+        formatter.options_mut().set_branch_leading_zeros(true);
+        formatter.options_mut().set_leading_zeros(false);
+        formatter.options_mut().set_small_hex_numbers_in_decimal(false);
+        formatter.options_mut().set_cc_e(CC_e::z);
+        formatter.options_mut().set_cc_ne(CC_ne::nz);
+    } else {
+        formatter.options_mut().set_uppercase_keywords(true);
+        formatter.options_mut().set_uppercase_all(true);
+    }
     let mut instr = Instruction::default();
-
-    const BYTES_PER_LINE: usize = 8;
 
     while decoder.can_decode() {
         decoder.decode_out(&mut instr);
-        let ip = instr.ip() as u32;
-        let instr_len = instr.len();
-        let instr_start = (ip - sym_offset) as usize;
-        let bytes = &code[instr_start..instr_start + instr_len];
+        let ip = instr.ip();
 
         // format the mnemonic
-        let mut upper_output = UppercaseOutput(String::new());
+        let mut upper_output = UppercaseOutput::new(!compact);
         formatter.format(&instr, &mut upper_output);
-        let mnemonic = upper_output.0;
+        let mnemonic = upper_output.s;
 
-        // first line: address + up to BYTES_PER_LINE hex bytes + mnemonic
-        let first_chunk = bytes.len().min(BYTES_PER_LINE);
-        let hex: String = bytes[..first_chunk]
-            .iter()
-            .map(|b| format!("{b:02x} "))
-            .collect();
-        println!("        {ip:08x} {hex:<16} {mnemonic}");
+        if compact {
+            // Ghidra-style: "addr: MNEMONIC operands"
+            // Strip default segment prefixes (DS:, SS:) that Ghidra suppresses
+            let mnemonic = mnemonic.replace("DS:", "").replace("SS:", "");
+            // Pad bare absolute addresses [0xNNN] to 8 digits to match Ghidra
+            let mnemonic = pad_absolute_addrs(&mnemonic);
+            println!("{ip:08x}: {mnemonic} ");
+        } else {
+            let instr_len = instr.len();
+            let instr_start = (ip - ip_start) as usize;
+            let bytes = &code[instr_start..instr_start + instr_len];
 
-        // continuation lines for long instructions
-        let mut off = first_chunk;
-        while off < bytes.len() {
-            let chunk_end = (off + BYTES_PER_LINE).min(bytes.len());
-            let hex: String = bytes[off..chunk_end]
+            // split formatted text into opcode and operands for column alignment
+            let (opcode, operands) = match mnemonic.find(' ') {
+                Some(i) => (&mnemonic[..i], &mnemonic[i + 1..]),
+                None => (mnemonic.as_str(), ""),
+            };
+
+            // <=4 bytes: all on first line; >4 bytes: 3 on first line
+            let first_chunk = if bytes.len() > 4 { 3 } else { bytes.len() };
+            let hex: String = bytes[..first_chunk]
                 .iter()
                 .map(|b| format!("{b:02x} "))
                 .collect();
-            println!("                  {hex}");
-            off = chunk_end;
+            println!("        {ip:08x} {hex:<16}{opcode:<11}{operands}");
+
+            // continuation lines for long instructions
+            let mut off = first_chunk;
+            while off < bytes.len() {
+                let chunk_end = (off + 4).min(bytes.len());
+                let hex: String = bytes[off..chunk_end]
+                    .iter()
+                    .map(|b| format!("{b:02x} "))
+                    .collect();
+                println!("                 {hex}");
+                off = chunk_end;
+            }
         }
     }
 
     Ok(())
+}
+
+struct OwnedSymbolResolver {
+    symbols: HashMap<u64, String>,
+}
+
+impl SymbolResolver for OwnedSymbolResolver {
+    fn symbol(
+        &mut self,
+        _instruction: &Instruction,
+        _operand: u32,
+        _instruction_operand: Option<u32>,
+        address: u64,
+        _address_size: u32,
+    ) -> Option<SymbolResult<'_>> {
+        let name = self.symbols.get(&address)?;
+        Some(SymbolResult::with_str(address, name.as_str()))
+    }
 }
 
 fn cmd_dump(path: &str) -> Result<()> {
@@ -953,10 +1280,28 @@ fn main() -> Result<()> {
             cmd_dump(&args[2])?;
         }
         "disasm" => {
-            if args.len() < 4 {
-                usage();
+            let mut i = 2;
+            let mut sym_file = None;
+            let mut compact = false;
+            while i < args.len() && args[i].starts_with('-') {
+                match args[i].as_str() {
+                    "--with-symbols" => {
+                        i += 1;
+                        if i >= args.len() { usage(); }
+                        sym_file = Some(args[i].as_str());
+                        i += 1;
+                    }
+                    "--compact" => {
+                        compact = true;
+                        i += 1;
+                    }
+                    _ => usage(),
+                }
             }
-            cmd_disasm(&args[2], &args[3])?;
+            if i + 2 > args.len() { usage(); }
+            let obj_path = &args[i];
+            let symbol_name = &args[i + 1];
+            cmd_disasm(obj_path, symbol_name, sym_file, compact)?;
         }
         _ => usage(),
     }
