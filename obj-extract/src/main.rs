@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use anyhow::{bail, Context, Result};
-use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, NasmFormatter};
+use iced_x86::{Decoder, DecoderOptions, Formatter, FormatterOutput, FormatterTextKind, Instruction, MasmFormatter};
 use std::env;
 use std::fs;
 
@@ -58,8 +58,10 @@ struct FixupSub {
     data_offset: u16,
     frame_method: u8,
     frame_datum: usize,
+    frame_via_thread: bool,
     target_method: u8,
     target_datum: usize,
+    target_via_thread: bool,
     displacement: u32,
 }
 
@@ -352,15 +354,16 @@ fn parse_record(raw: &RawRecord) -> Record {
                     let location_type = (locat_hi >> 2) & 0x0f;
                     let data_offset = (((locat_hi & 0x03) as u16) << 8) | locat_lo as u16;
 
+                    // fix_dat byte: F(7) FRAME(6-4) T(3) TARGT(2-0)
                     if p >= d.len() { break; }
                     let fix_dat = d[p];
                     p += 1;
 
+                    let frame_via_thread = (fix_dat & 0x80) != 0;
                     let frame_method;
                     let mut frame_datum = 0usize;
-                    if fix_dat & 0x80 != 0 {
-                        // frame determined by thread
-                        frame_method = (fix_dat >> 4) & 0x07;
+                    if frame_via_thread {
+                        frame_method = (fix_dat >> 4) & 0x03; // thread number
                     } else {
                         frame_method = (fix_dat >> 4) & 0x07;
                         if frame_method <= 2 {
@@ -368,17 +371,21 @@ fn parse_record(raw: &RawRecord) -> Record {
                         }
                     }
 
+                    let target_via_thread = (fix_dat & 0x08) != 0;
+                    let targt = fix_dat & 0x07;
                     let target_method;
                     let mut target_datum = 0usize;
-                    if fix_dat & 0x40 != 0 {
-                        // target determined by thread
-                        target_method = fix_dat & 0x07;
+                    let has_displacement;
+                    if target_via_thread {
+                        target_method = targt & 0x03; // thread number
+                        has_displacement = (targt & 0x04) == 0;
                     } else {
-                        target_method = fix_dat & 0x03;
+                        target_method = targt & 0x03;
+                        has_displacement = (targt & 0x04) == 0;
                         target_datum = read_index(d, &mut p).unwrap_or(0);
                     }
 
-                    let displacement = if (fix_dat & 0x04) == 0 {
+                    let displacement = if has_displacement {
                         if is32 {
                             read_u32(d, &mut p).unwrap_or(0)
                         } else {
@@ -394,13 +401,19 @@ fn parse_record(raw: &RawRecord) -> Record {
                         data_offset,
                         frame_method,
                         frame_datum,
+                        frame_via_thread,
                         target_method,
                         target_datum,
+                        target_via_thread,
                         displacement,
                     });
                 } else {
                     // THREAD subrecord
-                    let is_frame = (b & 0x40) == 0;
+                    // bit 6: D (0=target, 1=frame)
+                    // bit 5: 0 (reserved)
+                    // bits 4-2: method
+                    // bits 1-0: thread number
+                    let is_frame = (b & 0x40) != 0;
                     let method = (b >> 2) & 0x07;
                     let thread_num = b & 0x03;
                     p += 1;
@@ -477,6 +490,7 @@ struct OmfModule {
     lnames: Vec<String>,
     segments: Vec<SegInfo>,
     groups: Vec<GrpInfo>,
+    extdefs: Vec<String>,
 }
 
 impl OmfModule {
@@ -485,6 +499,7 @@ impl OmfModule {
             lnames: Vec::new(),
             segments: Vec::new(),
             groups: Vec::new(),
+            extdefs: Vec::new(),
         };
         for rec in records {
             match rec {
@@ -503,6 +518,9 @@ impl OmfModule {
                         name_idx: *name_idx,
                         segs: segs.clone(),
                     });
+                }
+                Record::Extdef { names, .. } => {
+                    m.extdefs.extend(names.iter().cloned());
                 }
                 _ => {}
             }
@@ -561,6 +579,38 @@ impl OmfModule {
             }
         }
         0
+    }
+
+    fn extdef_name(&self, idx: usize) -> String {
+        if idx == 0 {
+            return "(none)".to_string();
+        }
+        match self.extdefs.get(idx - 1) {
+            Some(s) => s.clone(),
+            None => format!("ext#{idx}"),
+        }
+    }
+
+    fn grp_label(&self, idx: usize) -> String {
+        if idx == 0 {
+            return "(none)".to_string();
+        }
+        match self.groups.get(idx - 1) {
+            Some(grp) => match self.lnames.get(grp.name_idx.wrapping_sub(1)) {
+                Some(s) if !s.is_empty() => s.clone(),
+                _ => format!("grp#{idx}"),
+            },
+            None => format!("grp#{idx}"),
+        }
+    }
+
+    fn fixup_target_label(&self, method: u8, datum: usize) -> String {
+        match method & 0x03 {
+            0 => self.seg_label(datum),   // segment index
+            1 => self.grp_label(datum),   // group index
+            2 => self.extdef_name(datum), // external index
+            _ => format!("?({method},{datum})"),
+        }
     }
 
     /// Reconstruct a segment's data by merging all LEDATA records.
@@ -722,9 +772,46 @@ fn dump_record(raw: &RawRecord, rec: &Record, rec_index: usize, module: &OmfModu
             print!("seg {} @ 0x{offset:04x}", module.seg_label(*seg_idx));
         }
         Record::Fixupp { fixups, threads, .. } => {
-            print!("{} fixup(s)", fixups.len());
-            if !threads.is_empty() {
-                print!(", {} thread(s)", threads.len());
+            let loc_type_name = |t: u8| -> &'static str {
+                match t {
+                    0 => "lobyte",
+                    1 => "offset16",
+                    2 => "base",
+                    3 => "ptr16:16",
+                    4 => "hibyte",
+                    5 => "offset16(lr)",
+                    9 => "offset32",
+                    11 => "ptr16:32",
+                    13 => "offset32(lr)",
+                    _ => "?",
+                }
+            };
+            // build thread table for resolving thread-based fixups
+            let mut target_threads: [Option<(u8, usize)>; 4] = [None; 4];
+            for t in threads {
+                if !t.is_frame {
+                    target_threads[t.thread_num as usize] = Some((t.method, t.index));
+                }
+            }
+            for f in fixups {
+                let rel = if f.is_seg_relative { "self-rel" } else { "direct" };
+                let target = if f.target_via_thread {
+                    match target_threads[f.target_method as usize] {
+                        Some((method, datum)) => module.fixup_target_label(method, datum),
+                        None => format!("thread#{}", f.target_method),
+                    }
+                } else {
+                    module.fixup_target_label(f.target_method, f.target_datum)
+                };
+                print!(
+                    "{rel} {typ} @0x{off:03x} -> {target}",
+                    typ = loc_type_name(f.location_type),
+                    off = f.data_offset,
+                );
+                if f.displacement != 0 {
+                    print!("+0x{:x}", f.displacement);
+                }
+                print!("; ");
             }
         }
         Record::Linnum { seg_idx, entries, .. } => {
@@ -744,6 +831,19 @@ fn dump_record(raw: &RawRecord, rec: &Record, rec_index: usize, module: &OmfModu
 }
 
 // --- Commands ---
+
+struct UppercaseOutput(String);
+
+impl FormatterOutput for UppercaseOutput {
+    fn write(&mut self, text: &str, kind: FormatterTextKind) {
+        match kind {
+            FormatterTextKind::Mnemonic | FormatterTextKind::Register | FormatterTextKind::Keyword => {
+                self.0.push_str(&text.to_uppercase());
+            }
+            _ => self.0.push_str(text),
+        }
+    }
+}
 
 fn usage() -> ! {
     eprintln!("usage: obj-extract <command> [args...]");
@@ -786,9 +886,15 @@ fn cmd_disasm(path: &str, symbol_name: &str) -> Result<()> {
 
     println!("{symbol_name}:");
     let mut decoder = Decoder::with_ip(32, code, sym_offset as u64, DecoderOptions::NONE);
-    let mut formatter = NasmFormatter::new();
-    let mut output = String::new();
+    let mut formatter = MasmFormatter::new();
+    formatter.options_mut().set_uppercase_mnemonics(true);
+    formatter.options_mut().set_uppercase_registers(true);
+    formatter.options_mut().set_uppercase_keywords(true);
+    formatter.options_mut().set_uppercase_all(true);
+    formatter.options_mut().set_space_after_operand_separator(false);
     let mut instr = Instruction::default();
+
+    const BYTES_PER_LINE: usize = 8;
 
     while decoder.can_decode() {
         decoder.decode_out(&mut instr);
@@ -797,10 +903,30 @@ fn cmd_disasm(path: &str, symbol_name: &str) -> Result<()> {
         let instr_start = (ip - sym_offset) as usize;
         let bytes = &code[instr_start..instr_start + instr_len];
 
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        output.clear();
-        formatter.format(&instr, &mut output);
-        println!("  0x{ip:04x}  {hex:<16}{output}");
+        // format the mnemonic
+        let mut upper_output = UppercaseOutput(String::new());
+        formatter.format(&instr, &mut upper_output);
+        let mnemonic = upper_output.0;
+
+        // first line: address + up to BYTES_PER_LINE hex bytes + mnemonic
+        let first_chunk = bytes.len().min(BYTES_PER_LINE);
+        let hex: String = bytes[..first_chunk]
+            .iter()
+            .map(|b| format!("{b:02x} "))
+            .collect();
+        println!("        {ip:08x} {hex:<16} {mnemonic}");
+
+        // continuation lines for long instructions
+        let mut off = first_chunk;
+        while off < bytes.len() {
+            let chunk_end = (off + BYTES_PER_LINE).min(bytes.len());
+            let hex: String = bytes[off..chunk_end]
+                .iter()
+                .map(|b| format!("{b:02x} "))
+                .collect();
+            println!("                  {hex}");
+            off = chunk_end;
+        }
     }
 
     Ok(())
