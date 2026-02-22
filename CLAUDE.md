@@ -29,7 +29,19 @@
   - `getHandleEntry(handle, alloc)` — low-level index → entry pointer
   - `getHandleUserData(handle)` / `setHandleUserData(handle, data)` — cached data access
   - `resolveHandlePath(handle)` — builds filepath from property store sections 0x5FC3/0x5FC4
-- **String tables** — ID scheme: `groupID * 1000 + stringIndex`
+- **String tables** — `.RES` files, plain text with `\r\n` line endings, 1-indexed (line 1 = index 1)
+  - ID scheme: `groupID * 1000 + stringIndex`, `getString(id)` → group `id/1000`, index `id%1000`
+  - Escape sequences on load: `\n`/`\r` → newline, `\<CR>` → skip
+  - `loadStringGroup(groupId, filename, flags)` / `unloadStringGroup` / `getString` / `getStringCopy`
+- **Part names** — in `INFO.RES`, string group 7001 (0x1b59). Tab-delimited: `<index>.\t<Name>\t<Description>`
+  - `getString(7001 + typeId)` → full info line, split on `\t` to get name/description
+  - INTRFACE.RES (group 2000) has UI labels, **not** part names
+  - Quick lookup: `res-extract cat INFO.RES | sed -n '$((id+1))p'` (e.g., id 7 → `sed -n '8p'` → Pulley)
+- **res-extract** — CLI tool at `res-extract/target/debug/res-extract`, extracts files from RESOURCE.MAP archives
+  - `res-extract ls` / `res-extract ls -l` — list files (default game dir: `./TIM3/TIMWIN`)
+  - `res-extract cat <file> ...` — dump file contents to stdout
+  - `res-extract extract <file> ...` — extract to disk
+  - `res-extract -d <game_dir> ...` — override game directory
 - **Property store** — two-level key-value map (section → key → string), also used for path interning by the handle table (sections 0x5FC3/0x5FC4)
   - `clearPropertySection(section)` / `loadPropertySection(section, stream, chunk_tag)` / `getPropertyValue(section, key)`
   - Section 0x5FC1 used as temporary bitmap name lookup during animation loading
