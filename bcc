@@ -1,0 +1,2 @@
+#!/bin/sh
+WINEPREFIX="$(cd "$(dirname "$0")" && pwd)/wine" exec wine C:\\BC45\\BIN\\BCC32.EXE "$@"
