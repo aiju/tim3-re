@@ -6,3 +6,6 @@ tim3.rep
 res-extract/target
 obj-extract/target
 wine/
+*.obj
+turboc.$ln
+symbols.jsonl

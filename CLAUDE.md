@@ -31,6 +31,37 @@
 - Prefer specific names over generic ones (e.g., `showSierraLogo` over `playIntro`)
 - **Custom structs:** Provide C-style struct definitions for the user to enter in Ghidra's Data Type Manager, then apply via `set_function_prototype` or data typing. Verify field names resolve correctly in decompiled output after applying
 
+## Matched Decompilation
+
+Recompiled C source lives in `src/`. The goal is to produce .obj files whose code is byte-identical to the original binary.
+
+### Workflow
+
+1. **Decompile** the target function via Ghidra MCP (`decompile_function`)
+2. **Get original disassembly** via Ghidra MCP (`disassemble_function`) — this is the ground truth
+3. **Write a rough first draft** in `src/` — don't overthink it, just clean up the decompilation into readable C and compile it. Seeing what the compiler actually produces is more useful than theorizing about codegen
+4. **Compile** with `make` (runs `./bcc` — Borland C 4.5 via Wine)
+5. **Compare disassembly** — use `obj-extract/target/debug/obj-extract disasm --compact --with-symbols symbols.jsonl src/foo.obj symbol` to get output in the same format as Ghidra, then compare. Without `--compact`, the output includes hex bytes and uses a more detailed layout, useful for inspecting encodings
+6. **Iterate** — adjust the C source until disassembly matches
+7. **Sync Ghidra names** — rename globals/functions/data in Ghidra to match names chosen in the C source
+
+### Codegen Pitfalls
+
+Things that affect whether Borland C 4.5 output matches the original:
+
+- **Expression nesting vs. temp variables** — `strcpy(strrchr(buf, '\\'), NULL)` as one expression causes the compiler to pre-push args across calls; splitting into `p = strrchr(...); strcpy(p, NULL);` changes push ordering
+- **Globals vs. locals/parameters** — e.g., `GetModuleFileNameA(g_instance, ...)` re-reads from the global, while `GetModuleFileNameA(hInstance, ...)` uses a register
+- **Precomputed flags** — `can_evict = (flags & 2) != 0` produces SETNZ+AND; testing `flags & 2` inline each iteration produces different code
+- **Variable declaration order** can affect register allocation
+- **Borland libc quirks** — e.g., `strcpy` is NULL-safe (writes `'\0'` to dst if src is NULL)
+- **`while` with comma operator** — `while (c = *p, c != '\0' && c != ' ')` generates a boolean intermediate (XOR/MOV/TEST). Use `while ((c = *p) != '\0' && c != ' ')` instead for clean short-circuit jumps matching the original
+- **Register allocation mismatch** — our Borland C 4.5 sometimes picks different variables for ESI/EDI than the original binary (e.g., putting `argc` in ESI when the original has it on the stack with `i` in ESI). Tried `volatile`, `register`, declaration reordering, `-r-`, pragma options — nothing fixes it. Might be a slightly wrong compiler version or unknown compiler flags. This cascades to which registers hold pointers (EAX vs EDX) and character temps (DL vs AL). Structural code still matches
+
+### Symbol Names
+
+- `__cdecl` functions get a `_` prefix in the object file (e.g., `gameAlloc` → `_gameAlloc`)
+- `__stdcall` functions have no prefix (e.g., `WinMain` → `WinMain`)
+
 ## Documentation
 
 - **doc.md** — accumulated reverse engineering notes (architecture, structs, subsystem docs). Consult when exploring unfamiliar code areas. These are best-effort guesses from ongoing RE work, not authoritative — always verify against the actual binary before relying on them.

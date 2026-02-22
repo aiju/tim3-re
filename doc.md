@@ -410,6 +410,9 @@
 ### UI
 - `createMainWindow` / `createChildWindow` / `destroyChildWindow`
 - `showDialog` — loads `.itf` (Sierra interface format) or standard Win32 dialog resources
+  - ITF path: loads ITF as hotspot surface, builds an in-memory `DLGTEMPLATE` via `buildDialogTemplate`, shows with `DialogBoxIndirectParamA`
+  - Non-ITF path: standard `DialogBoxParamA` with resource name
+  - `buildDialogTemplate(title, style_flags, x, y, width, height)` — allocates DLGTEMPLATE, converts pixel coords to dialog units via `GetDialogBaseUnits`, forces `WS_POPUP|WS_VISIBLE|WS_CLIPCHILDREN|DS_ABSALIGN`
 - **Part icons** — 10 atlas bitmaps (`icons0.bmp`–`icons9.bmp`), lazily loaded
   - `g_iconBitmaps` (0x47df80) — `int[10]` bitmap handles
   - `getPartTypeIcon(type_id)` → BitmapFrame* — indexes into atlases by type ID; pass -1 to release all
@@ -437,9 +440,28 @@
   - `g_itfChunkTag` (0x470078) — `"ITF:"` chunk tag constant
 - **ITF control dispatch table** — `g_itfControlDispatch` (0x47016c), 7 entries × 20 bytes, indexed directly by ITF control type ID
   - Entry: `{initProc, proc2, drawProc, eventProc, extraSize}` — procs assigned to hotspot callbacks during `loadItfFile`
-  - Only type 0 is populated: `initItfControl` / `drawItfControl` / `itfControlEventHandler`; types 1-6 are empty
   - `g_itfControlTypeCount` (0x470164) — bounds check (=7)
-  - Type 0's `initItfControl` dispatches on cursorType: type 4 (buttons) calls `readButtonExtData` to read extra fields from stream
+  - `initItfControl` dispatches on controlType: type 4 (text edit buttons) calls `readButtonExtData` to read extra fields from stream
+  - Known types: 1/2/5 have extraSize=0x1C (base only), 3 has 0x20, 4 has 0x54 (text edit)
+  - `loadItfFile` allocates all controls in one `gameAlloc` call: `num_controls * 0x40 + sum(extraSize)`
+- **ItfControlBase** — common 0x1C-byte sub-struct at offset 0x40 in all ITF controls (shared across all types)
+  - `{animHandle, baseFrame, frameCount, curFrame, drawOffsetX, drawOffsetY, _unknown18}`
+  - Animation frames: `baseFrame+0`=unfocused, `+1`=focused bg repaint, `+2`=focused text repaint, `+3..n`=cursor blink
+  - **NOTE:** struct grouping into ItfControlBase is tentative — we've confirmed the fields and their offsets, but the substruct boundary is inferred from extraSize alignment across types. The grouping may not exactly match the original source
+- **TextEditHotspot** (control type 4) — 0x94-byte struct extending Hotspot for editable text fields
+  - `{Hotspot(0x40), ItfControlBase ctrl(0x1C), TextCtrl textCtrl(0x2C), activeRendererId, activeColor, activeFontHandle}`
+  - On focus: saves textCtrl's `{rendererId, fontHandle, color}` to globals, applies `active*` properties
+  - On defocus: restores saved properties, clears `g_focusedHotspot`
+  - `readButtonExtData(hotspot, stream)` — reads active rendering properties + TextCtrl fields from ITF stream; fallback sets text="00000", color=15, flags|=0x200
+  - `handleTextEditInput(hotspot, event_type)` — event handler: mouse click positions cursor via `charAtPoint`, event 2=defocus, event 3=programmatic focus with `g_textEditCursorOffset`
+  - `charAtPoint(text_ctrl, x, y)` → char* — hit-tests screen coordinates to character position in formatted text
+  - `drawTextEditAnimated(hotspot)` — renders animation frames + text + cursor blink
+  - `focusTextEditHotspot(hotspot_id, cursor_offset, callback)` — programmatically transfers focus between text edits
+  - Cursor globals: `g_textCursorPos` (0x47bd24), `g_prevCursorPos` (0x47bd28), `g_cursorRectX`/`Y` (0x47bd38/3c), `g_cursorCharHeight` (0x47bd40), `g_cursorMoveCount` (0x47bd34)
+  - Saved state globals: `g_savedFontHandle` (0x47bd18), `g_savedRendererId` (0x47bd1c), `g_savedTextColor` (0x47bd20)
+  - `g_textEditRedrawCount` (0x47bd2c), `g_textEditRepaintCount` (0x47bd30) — draw counters decremented each frame
+  - `g_textEditCursorOffset` (0x490f0c) — desired cursor offset for programmatic focus via `focusTextEditHotspot`
+  - Accessors: `getTextEditText(hotspot_id)` → char*, `setTextEditText(hotspot_id, text, text_len)` (sets userData=1 as dirty flag), `setTextEditFont(hotspot_id, font_handle)` (sets both textCtrl and active font)
 - **Text renderer registry** — `g_textRenderers` (0x490394), 25 slots × 32 bytes, searched linearly by renderer ID
   - Entry: `{rendererId, vtable[7]}` — vtable: `{drawTextLine, proc2, getCharWidth, getCharHeight, getStringWidth, getStringHeight, slot7}`
   - `registerTextRenderer(id, vtable)` / `unregisterTextRenderer(id)` / `lookupTextRenderer(id)` → vtable*
