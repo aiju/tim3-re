@@ -1,0 +1,3 @@
+[submodule "GhidraMCP"]
+	path = GhidraMCP
+	url = git@github.com:aiju/GhidraMCP.git
