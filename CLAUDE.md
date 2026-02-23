@@ -17,6 +17,9 @@
 - **CRT/compiler-generated functions:** Prefix with `_` (e.g., `_crtExit`, `_runStaticDestructors`)
 - **Uncertain names:** Suffix with `_MAYBE` when evidence is suggestive but not conclusive (e.g., `g_hasCustomGravity_MAYBE`)
 - **Duplicate functions:** Suffix with `_DUP` when Borland C emitted identical code at two addresses (e.g., `getHandleUserData_DUP`)
+- **PartType descriptors:** `partFooBar` for the PartType data (e.g., `partConveyorBelt`). Type the data at the address as `PartType`
+- **Part-specific callbacks:** `partFooBarCallback` pattern (e.g., `partConveyorBeltCollision`, `partConveyorBeltTick`, `partConveyorBeltPerPartInit`, `partConveyorBeltCreate`, `partConveyorBeltPlacePart`). Use the PartType field name as the suffix: `Collision`, `Tick`, `PerPartInit`, `ActivatePart`, `PlacePart`, `Create`
+- **Function pointer struct fields:** Ghidra can't parse inline function pointer syntax in struct definitions. Define a typedef first (e.g., `typedef int (*CollisionFn)(Part *, Part *);`), then use the typedef name as the field type in the struct
 
 ## Workflow
 
@@ -26,6 +29,7 @@
 - Use `set_data_type` to type globals, strings, arrays, etc. Always try without `force` first — on conflict it reports what's already defined, so you can decide whether to override with `force=true`
 - For `rename_data` to stick, the address must have a defined data type first. Use `set_data_type` to define it, then rename
 - Rename parameters and locals alongside functions — don't leave param_1/param_2 behind
+- **Local variable rename order:** When renaming auto-generated locals (e.g., `iVar1`, `iVar4`, `iVar8`), rename from highest number to lowest. Ghidra reshuffles variable names after each rename, so renaming `iVar1` first can cause `iVar4` to become `iVar3`, invalidating subsequent renames
 - To set parameter names and types, use `set_function_prototype` — but omit the calling convention (e.g., `__cdecl`), as a Ghidra bug causes it to be treated as part of the name
 - **`__fastcall` misdetection:** Ghidra sometimes marks functions as `__fastcall` when ECX/EDX values leak through from callers. In this codebase everything is `__cdecl`. Symptoms: unused `param_1`/`param_2` in ECX/EDX, `extraout_ECX`/`extraout_EDX` noise, `in_stack_` references after prototype change. Fix: user must manually change calling convention to `__cdecl` in Ghidra's function editor before setting the prototype via API
 - Prefer specific names over generic ones (e.g., `showSierraLogo` over `playIntro`)
@@ -72,5 +76,7 @@ Things that affect whether Borland C 4.5 output matches the original:
 - `res-extract ls` / `res-extract ls -l` — list files (default game dir: `./TIM3/TIMWIN`)
 - `res-extract cat <file> ...` — dump file contents to stdout
 - `res-extract extract <file> ...` — extract to disk
+- `res-extract itf <file> ...` — parse and display ITF interface files (shows control types, IDs, positions, sizes, events)
+- `res-extract string <id> ...` — look up strings by getString ID. Group (id/1000) maps to .RES file, index (id%1000) selects the line. E.g., `res-extract string 7008` → group 7 = INFO.RES, line 8 = Pulley. Part names/descriptions: `7001 + typeId` (tab-delimited `index\tName\tDescription`)
+- `res-extract string --label <code> ...` — decode UI label codes (SSFNNN format: SS=scale, F=font, NNN=string index). Resolves getString(NNN+2000) from INTRFACE.RES and strips `~` markup (`~C`=color, `~JL/JC/JR`=justify, `~S`=scale, `~F`=font). E.g., `res-extract string --label 31074` → "Not in Solution"
 - `res-extract -d <game_dir> ...` — override game directory
-- Part name lookup: `res-extract cat INFO.RES | sed -n '$((id+1))p'` (e.g., id 7 → `sed -n '8p'` → Pulley)

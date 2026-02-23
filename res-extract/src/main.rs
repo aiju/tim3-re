@@ -329,6 +329,66 @@ fn print_itf(itf: &ItfFile) {
     }
 }
 
+/// Parse a .RES string table into lines (1-indexed in the game; returned as 0-indexed Vec).
+fn parse_string_table(data: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(data);
+    text.split('\n')
+        .map(|s| s.strip_suffix('\r').unwrap_or(s).to_string())
+        .collect()
+}
+
+/// Strip ~ escape markup from a label string, returning the display text.
+/// Markup: ~Cnnn=color, ~JL/JC/JR=justify, ~Snnn=scale, ~Fnnn=font
+fn strip_label_markup(s: &str) -> String {
+    let mut result = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '~' {
+            match chars.peek() {
+                Some(&'C' | &'S' | &'F') => {
+                    chars.next();
+                    while chars.peek().map_or(false, |ch| ch.is_ascii_digit()) {
+                        chars.next();
+                    }
+                }
+                Some(&'J') => {
+                    chars.next(); // J
+                    chars.next(); // L/C/R
+                }
+                _ => {
+                    result.push('~');
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Map group number (getString ID / 1000) to .RES filename.
+fn group_to_resource(group: u32) -> Option<&'static str> {
+    match group {
+        2 => Some("INTRFACE.RES"),
+        3 => Some("MUSIC.RES"),
+        4 => Some("SOUND.RES"),
+        5 => Some("DESCRIPT.RES"),
+        6 => Some("SOLVE.RES"),
+        7 => Some("INFO.RES"),
+        8 => Some("HELP.RES"),
+        9 => Some("DOSREQ.RES"),
+        10 => Some("PROFESOR.RES"),
+        11 => Some("PROGPART.RES"),
+        12 => Some("SIGNIN.RES"),
+        13 => Some("CREDITS.RES"),
+        14 => Some("BINSOLVE.RES"),
+        15 => Some("LANGUAGE.RES"),
+        17 => Some("TIMDOS.RES"),
+        50 => Some("CURSOR.RES"),
+        _ => None,
+    }
+}
+
 fn usage() -> ! {
     eprintln!("usage: res-extract [-d game_dir] <command> [args...]");
     eprintln!();
@@ -337,6 +397,8 @@ fn usage() -> ! {
     eprintln!("  extract <file> ...       extract files to disk");
     eprintln!("  cat <file> ...           write file contents to stdout");
     eprintln!("  itf <file> ...           parse and display ITF interface files");
+    eprintln!("  string <id> ...          look up strings by getString ID (e.g. 7008)");
+    eprintln!("  string --label <code> ...  decode label code (SSFNNN), print text");
     eprintln!();
     eprintln!("default game_dir: {DEFAULT_GAME_DIR}");
     std::process::exit(1);
@@ -442,6 +504,59 @@ fn main() -> Result<()> {
                     None => {
                         bail!("{} not found", name);
                     }
+                }
+            }
+        }
+        "string" => {
+            if file_args.is_empty() {
+                bail!("string requires at least one ID");
+            }
+            let label_mode = file_args.first().map(|s| s.as_str()) == Some("--label");
+            let id_args = if label_mode { &file_args[1..] } else { file_args };
+            if id_args.is_empty() {
+                bail!("string --label requires at least one label code");
+            }
+            let res_index = build_index(&entries);
+            // Cache loaded string tables by resource name
+            let mut table_cache: HashMap<&str, Vec<String>> = HashMap::new();
+
+            for id_str in id_args {
+                let raw_id: u32 = id_str.parse()
+                    .with_context(|| format!("invalid ID: {}", id_str))?;
+
+                let string_id = if label_mode {
+                    (raw_id % 1000) + 2000
+                } else {
+                    raw_id
+                };
+
+                let group = string_id / 1000;
+                let string_index = (string_id % 1000) as usize;
+                let res_name = match group_to_resource(group) {
+                    Some(n) => n,
+                    None => bail!("unknown string group {} (from ID {}); did you mean --label?", group, id_str),
+                };
+
+                let lines = match table_cache.get(res_name) {
+                    Some(l) => l,
+                    None => {
+                        let &ei = res_index.get(res_name)
+                            .ok_or_else(|| anyhow::anyhow!("{} not found in archive", res_name))?;
+                        let data = read_entry_data(&game_dir, &entries[ei])?;
+                        table_cache.insert(res_name, parse_string_table(&data));
+                        table_cache.get(res_name).unwrap()
+                    }
+                };
+
+                if string_index == 0 || string_index > lines.len() {
+                    bail!("string index {} out of range (1..{}) in {}; did you mean --label?", string_index, lines.len(), res_name);
+                }
+
+                let text = &lines[string_index - 1];
+                if label_mode {
+                    println!("{}", strip_label_markup(text));
+                } else {
+                    println!("{}", text);
                 }
             }
         }
