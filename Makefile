@@ -6,7 +6,7 @@ OBJS = $(SRCS:.c=.obj)
 all: $(OBJS)
 
 src/%.obj: src/%.c
-	$(BCC) -c -O1 -o$@ $<
+	$(BCC) -c -Od -k -o$@ $<
 
 clean:
 	rm -f $(OBJS)
