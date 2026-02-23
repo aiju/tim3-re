@@ -23,13 +23,13 @@
 - Use Ghidra MCP to decompile and rename functions/variables/globals
 - When exploring a function, recursively dig into subfunctions before naming — understand the full context first
 - Name things confidently when the evidence is clear; flag uncertainty when guessing
-- Call out string-smelling DAT_ addresses for the user to press `A` on in Ghidra (we lack a set-data-type API)
-- For arrays/buffers (e.g., `char[20]`), ask the user to define the data type in Ghidra first — `rename_data` won't stick on undefined bytes. Once typed, the rename works and the `&` prefix disappears in decompiled output
+- Use `set_data_type` to type globals, strings, arrays, etc. Always try without `force` first — on conflict it reports what's already defined, so you can decide whether to override with `force=true`
+- For `rename_data` to stick, the address must have a defined data type first. Use `set_data_type` to define it, then rename
 - Rename parameters and locals alongside functions — don't leave param_1/param_2 behind
 - To set parameter names and types, use `set_function_prototype` — but omit the calling convention (e.g., `__cdecl`), as a Ghidra bug causes it to be treated as part of the name
 - **`__fastcall` misdetection:** Ghidra sometimes marks functions as `__fastcall` when ECX/EDX values leak through from callers. In this codebase everything is `__cdecl`. Symptoms: unused `param_1`/`param_2` in ECX/EDX, `extraout_ECX`/`extraout_EDX` noise, `in_stack_` references after prototype change. Fix: user must manually change calling convention to `__cdecl` in Ghidra's function editor before setting the prototype via API
 - Prefer specific names over generic ones (e.g., `showSierraLogo` over `playIntro`)
-- **Custom structs:** Provide C-style struct definitions for the user to enter in Ghidra's Data Type Manager, then apply via `set_function_prototype` or data typing. Verify field names resolve correctly in decompiled output after applying
+- **Custom structs:** Use `create_data_type` to define structs directly from C definitions (e.g., `struct Foo { int x; char name[16]; };`). Use `update=true` to overwrite an existing type. For partially-understood structs, use anonymous fields (`int;`) for unknown members — Ghidra auto-names these as `field4_0x10` etc. in decompilation. Apply structs via `set_function_prototype` or `set_data_type`. Verify field names resolve correctly in decompiled output after applying
 
 ## Matched Decompilation
 
