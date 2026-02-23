@@ -1054,19 +1054,94 @@ impl SymbolTable {
     }
 }
 
+// --- LIB file support ---
+
+struct LibModule {
+    name: String,
+    offset: usize,
+    size: usize,
+}
+
+struct LibFile {
+    page_size: usize,
+    modules: Vec<LibModule>,
+}
+
+fn parse_lib(data: &[u8]) -> Result<LibFile> {
+    if data.len() < 10 || data[0] != 0xF0 {
+        bail!("not a valid OMF library file");
+    }
+    let rec_len = u16::from_le_bytes([data[1], data[2]]) as usize;
+    let page_size = rec_len + 3;
+
+    let mut modules = Vec::new();
+    let mut off = page_size; // first module starts after header page
+
+    while off < data.len() {
+        if data[off] == 0xF1 {
+            break; // library end record
+        }
+        if data[off] != 0x80 && data[off] != 0x82 {
+            bail!("expected THEADR/LHEADR at offset 0x{off:x}, got 0x{:02x}", data[off]);
+        }
+
+        // read module name from THEADR/LHEADR
+        let name_len = data[off + 3] as usize;
+        let name = String::from_utf8_lossy(&data[off + 4..off + 4 + name_len]).into_owned();
+
+        // scan records until MODEND
+        let mod_start = off;
+        let mut pos = off;
+        loop {
+            if pos + 3 > data.len() {
+                bail!("truncated record at offset 0x{pos:x}");
+            }
+            let rt = data[pos];
+            let rl = u16::from_le_bytes([data[pos + 1], data[pos + 2]]) as usize;
+            pos += 3 + rl;
+            if rt == 0x8A || rt == 0x8B {
+                break; // MODEND
+            }
+        }
+
+        modules.push(LibModule {
+            name,
+            offset: mod_start,
+            size: pos - mod_start,
+        });
+
+        // advance to next page boundary
+        off = ((pos + page_size - 1) / page_size) * page_size;
+    }
+
+    Ok(LibFile { page_size, modules })
+}
+
+fn is_lib_file(data: &[u8]) -> bool {
+    !data.is_empty() && data[0] == 0xF0
+}
+
 fn usage() -> ! {
     eprintln!("usage: obj-extract <command> [args...]");
-    eprintln!("  dump <file>                                 dump all OMF records");
+    eprintln!("  dump <file> [module]                        dump OMF records (module name required for .LIB)");
     eprintln!("  disasm [--with-symbols <symfile>] [--compact] <file> <symbol>  disassemble a function");
+    eprintln!("  lib ls <file>                               list modules in a .LIB file");
     std::process::exit(1);
+}
+
+fn load_module_from_bytes(data: &[u8]) -> Result<(Vec<RawRecord>, Vec<Record>, OmfModule)> {
+    let raws = split_records(data)?;
+    let records: Vec<Record> = raws.iter().map(|r| parse_record(r)).collect();
+    let module = OmfModule::build(&records);
+    Ok((raws, records, module))
 }
 
 fn load_module(path: &str) -> Result<(Vec<RawRecord>, Vec<Record>, OmfModule)> {
     let data = fs::read(path).with_context(|| format!("failed to read {path}"))?;
-    let raws = split_records(&data).with_context(|| format!("failed to parse {path}"))?;
-    let records: Vec<Record> = raws.iter().map(|r| parse_record(r)).collect();
-    let module = OmfModule::build(&records);
-    Ok((raws, records, module))
+    if is_lib_file(&data) {
+        bail!("{path} is a library file; use 'lib ls' to list modules, or specify a symbol for disasm");
+    }
+    load_module_from_bytes(&data).with_context(|| format!("failed to parse {path}"))
 }
 
 /// Pad absolute memory addresses like [0x490eec] to [0x00490eec] (8 hex digits).
@@ -1101,7 +1176,26 @@ fn pad_absolute_addrs(s: &str) -> String {
 }
 
 fn cmd_disasm(path: &str, symbol_name: &str, sym_file: Option<&str>, compact: bool) -> Result<()> {
-    let (_raws, records, module) = load_module(path)?;
+    let file_data = fs::read(path).with_context(|| format!("failed to read {path}"))?;
+
+    let obj_data = if is_lib_file(&file_data) {
+        let lib = parse_lib(&file_data)?;
+        // search all modules for the symbol
+        let mut found = None;
+        for m in &lib.modules {
+            let slice = &file_data[m.offset..m.offset + m.size];
+            let (_, recs, omf) = load_module_from_bytes(slice)?;
+            if omf.find_pubsym(symbol_name, &recs).is_some() {
+                found = Some(slice.to_vec());
+                break;
+            }
+        }
+        found.ok_or_else(|| anyhow::anyhow!("symbol not found in any library module: {symbol_name}"))?
+    } else {
+        file_data
+    };
+
+    let (_raws, records, module) = load_module_from_bytes(&obj_data)?;
 
     let (seg_idx, sym_offset) = module
         .find_pubsym(symbol_name, &records)
@@ -1259,10 +1353,34 @@ impl SymbolResolver for OwnedSymbolResolver {
     }
 }
 
-fn cmd_dump(path: &str) -> Result<()> {
-    let (raws, records, module) = load_module(path)?;
+fn cmd_dump(path: &str, module_name: Option<&str>) -> Result<()> {
+    let file_data = fs::read(path).with_context(|| format!("failed to read {path}"))?;
+
+    let obj_data = if is_lib_file(&file_data) {
+        let module_name = module_name.ok_or_else(|| {
+            anyhow::anyhow!("{path} is a library file; specify a module name (use 'lib ls' to list)")
+        })?;
+        let lib = parse_lib(&file_data)?;
+        let m = lib.modules.iter().find(|m| m.name == module_name)
+            .ok_or_else(|| anyhow::anyhow!("module not found in library: {module_name}"))?;
+        file_data[m.offset..m.offset + m.size].to_vec()
+    } else {
+        file_data
+    };
+
+    let (raws, records, module) = load_module_from_bytes(&obj_data)?;
     for (i, (raw, rec)) in raws.iter().zip(records.iter()).enumerate() {
         dump_record(raw, rec, i, &module, &records);
+    }
+    Ok(())
+}
+
+fn cmd_lib_ls(path: &str) -> Result<()> {
+    let file_data = fs::read(path).with_context(|| format!("failed to read {path}"))?;
+    let lib = parse_lib(&file_data)?;
+    println!("{} modules (page size {})", lib.modules.len(), lib.page_size);
+    for m in &lib.modules {
+        println!("  0x{:06x}  {}", m.offset, m.name);
     }
     Ok(())
 }
@@ -1277,7 +1395,17 @@ fn main() -> Result<()> {
             if args.len() < 3 {
                 usage();
             }
-            cmd_dump(&args[2])?;
+            let module_name = if args.len() > 3 { Some(args[3].as_str()) } else { None };
+            cmd_dump(&args[2], module_name)?;
+        }
+        "lib" => {
+            if args.len() < 4 {
+                usage();
+            }
+            match args[2].as_str() {
+                "ls" => cmd_lib_ls(&args[3])?,
+                _ => usage(),
+            }
         }
         "disasm" => {
             let mut i = 2;
