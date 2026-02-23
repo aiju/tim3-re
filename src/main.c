@@ -4,11 +4,55 @@
 extern HINSTANCE g_instance;
 extern HWND g_mainWindow;
 extern int g_exitCode;
-
-void gameMain(void);
+extern int g_gameRunning;
+extern int g_currentTrack;
+extern char *g_menuName;
+extern char *g_className;
+extern char *g_childIcon;
 
 extern char **g_argv;
 void *gameAlloc(int size, int flags);
+
+void noop(void);
+void initPaths(int);
+void checkHolidayArg(int argc, int *argv);
+void initGame(void);
+void initTitleScreen(void);
+int showSierraLogo(void);
+int playTitleAnimation(void);
+void shutdownTitleScreen(void);
+void showCredits(void);
+void playSound(int track, int param2, int param3);
+void processSoundQueue(void);
+void gameLoop(void);
+void cleanupGame(void);
+
+void gameMain(void)
+{
+	if (FindWindowA(NULL, "The Incredible Machine") != NULL)
+		return;
+	SetCursor(LoadCursorA(NULL, IDC_WAIT));
+	noop();
+	g_menuName = NULL;
+	g_className = NULL;
+	g_childIcon = NULL;
+	initPaths(0);
+	checkHolidayArg(0, NULL);
+	initGame();
+	initTitleScreen();
+	if (showSierraLogo() == 0 && playTitleAnimation() == 0) {
+		shutdownTitleScreen();
+		showCredits();
+	} else {
+		shutdownTitleScreen();
+	}
+	g_gameRunning = 1;
+	g_currentTrack = 1000;
+	playSound(g_currentTrack, 0, 1);
+	processSoundQueue();
+	gameLoop();
+	cleanupGame();
+}
 
 int buildArgv(char *cmd_line)
 {
