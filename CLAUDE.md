@@ -4,7 +4,7 @@
 
 - **Game:** The Incredible Machine 3 (Windows, Sierra Entertainment)
 - **Platform:** Win32s (Win32 subset running on Windows 3.1 — cooperative multitasking)
-- **Compiler:** Borland C (not C++ — hand-rolled polymorphism, no vtables in objects, all __cdecl)
+- **Compiler:** Borland C (not C++ — hand-rolled polymorphism, no vtables in objects). Game functions are all `__cdecl`; Win32 callbacks (WndProc, DlgProc, etc.) are `__stdcall`
 - **Types:** No native `bool` — boolean functions return `int` (0/1). Use `int` not `bool` in prototypes.
 - **SEH:** `_sehSetup` at top of many functions is Borland's structured exception handling boilerplate — ignore it
 
@@ -15,11 +15,12 @@
 - **Local variables/parameters:** `snake_case`
 - **libc functions:** Use standard names (`strcpy`, `strrchr`, `strcmp`, etc.)
 - **CRT/compiler-generated functions:** Prefix with `_` (e.g., `_crtExit`, `_runStaticDestructors`)
-- **Uncertain names:** Suffix with `_MAYBE` when evidence is suggestive but not conclusive (e.g., `g_hasCustomGravity_MAYBE`)
+- **Uncertain names:** Suffix with `_MAYBE` when evidence is suggestive but not conclusive (e.g., `g_partBinFilterMode_MAYBE`)
 - **Duplicate functions:** Suffix with `_DUP` when Borland C emitted identical code at two addresses (e.g., `getHandleUserData_DUP`)
 - **PartType descriptors:** `partFooBar` for the PartType data (e.g., `partConveyorBelt`). Type the data at the address as `PartType`
-- **Part-specific callbacks:** `partFooBarCallback` pattern (e.g., `partConveyorBeltCollision`, `partConveyorBeltTick`, `partConveyorBeltPerPartInit`, `partConveyorBeltCreate`, `partConveyorBeltPlacePart`). Use the PartType field name as the suffix: `Collision`, `Tick`, `PerPartInit`, `ActivatePart`, `PlacePart`, `Create`
+- **Part-specific callbacks:** `partFooBarCallback` pattern (e.g., `partConveyorBeltCollision`, `partConveyorBeltTick`, `partConveyorBeltRecalculate`, `partConveyorBeltCreate`, `partConveyorBeltPlacePart`). Use the PartType field name as the suffix: `Collision`, `Tick`, `Recalculate`, `RotateOrFlip`, `PlacePart`, `Create`
 - **Function pointer struct fields:** Ghidra can't parse inline function pointer syntax in struct definitions. Define a typedef first (e.g., `typedef int (*CollisionFn)(Part *, Part *);`), then use the typedef name as the field type in the struct
+- **Hotspot embedding:** Hotspot (0x40 bytes) is often embedded as the first member of larger structs with the pattern `{Hotspot, ItfControlBase, <type-specific extra data>}`. Standalone Hotspots have zero at offset 0x40 (where `ItfControlBase.animHandle` would be). Ghidra shows accesses to the ItfControlBase as `pHotspot[1].next` / `pHotspot[1].prev` etc. — these map to `ItfControlBase.animHandle`, `.baseFrame`, etc.
 
 ## Workflow
 
@@ -31,7 +32,7 @@
 - Rename parameters and locals alongside functions — don't leave param_1/param_2 behind
 - **Local variable rename order:** When renaming auto-generated locals (e.g., `iVar1`, `iVar4`, `iVar8`), rename from highest number to lowest. Ghidra reshuffles variable names after each rename, so renaming `iVar1` first can cause `iVar4` to become `iVar3`, invalidating subsequent renames
 - To set parameter names and types, use `set_function_prototype` — but omit the calling convention (e.g., `__cdecl`), as a Ghidra bug causes it to be treated as part of the name
-- **`__fastcall` misdetection:** Ghidra sometimes marks functions as `__fastcall` when ECX/EDX values leak through from callers. In this codebase everything is `__cdecl`. Symptoms: unused `param_1`/`param_2` in ECX/EDX, `extraout_ECX`/`extraout_EDX` noise, `in_stack_` references after prototype change. Fix: user must manually change calling convention to `__cdecl` in Ghidra's function editor before setting the prototype via API
+- **Calling convention misdetection:** Ghidra sometimes marks game functions as `__fastcall` or `__thiscall` when ECX/EDX values leak through from callers. Game functions are all `__cdecl` (Win32 callbacks are `__stdcall`). Symptoms: spurious `this`/`param_1`/`param_2` in ECX/EDX, `extraout_ECX`/`extraout_EDX` noise, `in_stack_` references after prototype change. Fix: use `set_calling_convention` to change to `__cdecl` (or `__stdcall` for Win32 callbacks) before setting the prototype
 - Prefer specific names over generic ones (e.g., `showSierraLogo` over `playIntro`)
 - **Custom structs:** Use `create_data_type` to define structs directly from C definitions (e.g., `struct Foo { int x; char name[16]; };`). Use `update=true` to overwrite an existing type. For partially-understood structs, use anonymous fields (`int;`) for unknown members — Ghidra auto-names these as `field4_0x10` etc. in decompilation. Apply structs via `set_function_prototype` or `set_data_type`. Verify field names resolve correctly in decompiled output after applying
 

@@ -87,6 +87,15 @@
   - `copySurfaceRect(dest, dest_rect, src, src_rect)` — copies rect between surfaces; fast path for same-size, falls back to `blitFrameScaled` for scaling; NULL surface = active surface
   - `fillRect(x, y, w, h)` — solid fill via vtable; `fillSurface(surface, color_or_tile, tile_resource)` — solid or tiled fill
   - `resetClipRect` — sets clip rect to full surface dimensions
+  - `drawPart(part, layer)` — dispatches to `PartType.drawFn`; skips if detail level low and part has detail-only flag (flags3 & 0x1000)
+  - `drawPartClipped(part, layer)` — draws a part clipped to dirty rects. Rope (10), Steel Cable (0x4c), and Belt (8) bypass clipping (line-based, no simple bbox). Other parts: checks each dirty rect — if fully contained, draws unclipped and returns; if partially overlapping, sets clip rect and draws (may draw multiple times). Resets clip rect after loop
+  - `drawAllParts` — iterates render layers 8→0 (back to front); for each part, draws via `drawPart` or `drawPartClipped` (based on dirtyFlags & 0x40); collects pipe overlay parts (flags3 & 0x2000) and draws overlays after each layer; clears render layer heads when done
+  - `drawOverlays(part)` — dispatches to pipe overlay draw (via `isPipeType`) or large pipe overlay draw (type 0x76)
+  - `buildAndDrawRenderLayers(full_redraw)` — builds render layer lists from physics+bg parts via `insertIntoRenderLayers`, inserts selected part via `insertSelectedPartSorted`, then calls `drawAllParts`
+  - `insertIntoRenderLayers(part)` — inserts part at head of its render layer linked lists (up to 2 layers per PartType.renderLayers); sets flags3 & 0x20 ("in render list")
+  - `insertSelectedPartSorted` — inserts `g_selectedPart` into render layers with priority-based sorted insertion (via `pickHigherPriorityPart`)
+  - `clearRenderLayers` — zeroes all 9 render layer heads
+  - `g_renderLayerHeads` (0x481198) — `Part*[9]`, per-layer linked list heads for z-ordered rendering
   - `renderFrame` — per-frame render: processes dirty rects, draws selected part overlay, connection lines, hotspots
   - `g_selectedPartOverlay` (0x477960) — highlight mode for selected part: -1=none, 0=suppressed, 1=valid, 2=overlap
   - `g_connectionLineColor` (0x477964) — rubber-band line color: -1=none, 0x87=invalid, 0x88=valid
@@ -139,30 +148,48 @@
   - `initGameSession` — applies palette, `showLoadingScreen` (loads all 281 part types), starts music
   - `initPlayfield` — clears edit state, calls `resetPartStates`
   - `showMainMenu` — tears down gameplay windows, shows menu/lobby dialogs
+  - `showMainMenuLoop` (0x422b70) — main menu event loop; decrements `g_helpLaunchCountdown`
+  - `mainMenuWndProc` (0x422cf9) — WndProc for main menu window (`g_mainMenuWindow`)
+  - `handleMainMenuCommand(command_id)` — dispatches lobby commands: 0x659a=Freeform, 0x659b=Puzzles, 0x659c=H2H, 0x659f=Editor, 0x659e=sign-in, 0x3e90=quit, 0x65a2=prefs, 10000=intro sequence
+  - `handleToolbarCommand(command_id)` — dispatches toolbar button commands: 0x88bd=run sim, 0x88ba=load, 0x88c0=reset, 0x88be=hints, 0x88cb=edit level, 0x88ca=freeform, 0x88c9=puzzles, 0x88c8=H2H, 0x88c5=editor, 0x88c4=help
   - `handlePartInteraction` — big switch on `g_editMode`, processes clicks/drags per mode
-  - `handleBeltPlacement` / `handleRopePlacement` — belt/rope connection placement sub-handlers
+  - `handleRopePlacement` / `handleBeltPlacement` — rope/belt connection placement sub-handlers
   - `findPartAtCursor(exclude_part)` → Part* — iterates bg+physics layers, resolves priority between overlapping parts
   - `hitTestPartAtCursor(exclude_part, test_part)` → Part* — per-part hit-test, returns part or connection owner if cursor hits attachment point
   - `findConnectablePartAtCursor(out_conn_idx, exclude_part)` → Part* — finds part with free connection slot under cursor, returns closer conn index (0/1) via out param
-  - `hitTestPartHandles(part)` → int (g_editMode value) — tests cursor against resize/flip/grab/connect handles
+  - `hitTestPartHandles(part)` → int (g_editMode value) — tests cursor against resize/flip/grab/connect handles; uses `getPartHandleFlags` to determine which handles are available
+  - `getPartHandleFlags(part)` → uint — computes bitmask of available interaction handles: 0x1=resize horizontal, 0x2=resize vertical, 0x4/0x8=flip, 0x10/0x400=on/off toggle, 0x40=delete, 0x80/0x800=settings, 0x100=drag, 0x200=solve, 0x1000/0x2000=reorder. Flip handles test overlap before enabling (tries flip, checks `isPartOverlappingOthers`, reverts)
+  - `handlePartResize` — resize mode dispatcher; saves original x/y/bboxW/bboxH, dispatches to `resizePartLeft`/`resizePartRight`/`resizePartTop`/`resizePartBottom` by editMode (3-6), calls `placePartFn` + `updateRenderPosition` + dirty rects on change
+  - `showPartSettingsDialog(part)` — opens `PROG_%d.ITF` dialog for programmable parts (flags3 & 0x400); on confirm, calls `applyPartSettings` to write settings to part
+  - `applyPartSettings(part)` — applies settings dialog state to a part: type-specific (0x1b=pulse count, 0x57=physics config, 0x7f=color, 0x88=character), calls `recalculateFn` + `updateRenderPosition`, sets `g_puzzleModified`
+  - **PROG*.ITF files** — one per programmable part type (e.g., `PROG136.ITF` = Message Computer, `PROG87.ITF` = Programmable Ball). Control IDs in the ITF map directly to hotspot IDs in code
+    - Shared base controls across all PROG*.ITF: 0x5dc0 (background), 0x5dc1 (display window), 0x5dc2 (up), 0x5dc3 (down), 0x5dc4 (done)
+    - Part-specific controls (e.g., slider buttons/tracks) use higher IDs in the 0x5df6–0x5e0d range (Programmable Ball only)
+  - `programPartDlgProc` — Win32 dialog proc for the settings dialog; dispatches hotspot click events (msg 0x2400) to `programPartHandleClick`
+  - `programPartHandleClick(hotspot_id)` — handles button/slider clicks: type-dependent up/down for main value, slider inc/dec for ball properties, OK/cancel/help
+  - `initPartSettings(part)` — loads animation entries from PROGPART.RES, initializes slider/value state from part data
+  - `updateSlider(hotspot, mode)` — slider drag/position handler; mode=2 = set position from value, otherwise handles mouse drag
+  - Dialog state globals: `g_progPartDlgResult` (0=running, 1=OK, 0xfe64=cancel), `g_progPartTypeId`, `g_progPartAnimIndex`, `g_progPartCanPlace`, `g_progPartPulseCount` (phazer 0-99), `g_progPartColorIndex` (color block 0-43), `g_progPartCharIndex` (message computer 0-108), `g_progPartSlider0`–`g_progPartSlider4` (ball properties), `g_progPartAnimEntries` (0x47fb5c, 16×3 int array)
+  - `handlePlacementKeys` — keyboard handler during part placement: +/- resize bboxW or bboxH (inclines always resize width), X/Y call `flipPartX`/`flipPartY`
   - `pickHigherPriorityPart(a, b)` → Part* — compares by layer, type priority, weight, position
   - `isPointInsidePart(reference_part, test_part)` → int — polygon hit-test; NULL reference uses cursor pos
   - `distSqToCursor(part)` → int — squared distance from cursor to part's bbox center
-  - `g_partPickFilter` (0x481018) — 0=all, 1=belt-connectable (flags2 & 0x04), 2=rope-connectable (flags2 & 0x01)
+  - `g_partPickFilter` (0x481018) — 0=all, 1=rope-connectable (flags2 & 0x04), 2=belt-connectable (flags2 & 0x01)
   - `g_secondaryPickedPart` (0x480fb0) — runner-up Part* from `findPartAtCursor`
-  - `g_beltAnchorPart` (0x480904) — Part* being connected from during belt placement
+  - `g_ropeAnchorPart` (0x480904) — Part* being connected from during rope placement
 - **Part removal:**
-  - `deleteSelectedPart` — removes `g_selectedPart` with type-specific handling: disconnects ropes/belts, removes Remote Control paired explosives, returns generic parts to bin
-  - `cleanupAndFreeRemovedPart` — cascade cleanup for part in fg layer: disconnects attachments, ropes, rewires pulleys (bypasses removed pulley), removes belt connections, then `freePartIfPuzzleMode`
+  - `deleteSelectedPart` — removes `g_selectedPart` with type-specific handling: disconnects belts/ropes, removes Remote Control paired explosives, returns generic parts to bin
+  - `cleanupAndFreeRemovedPart` — cascade cleanup for part in fg layer: disconnects attachments, belts, rewires pulleys (bypasses removed pulley), removes rope connections, then `freePartIfPuzzleMode`
   - `returnPartToBin(part)` — disconnects part's connections, clears placed flags (0x8000 from flags1, 0x40 from flags2), unlinks from current layer, reinserts sorted into `g_fgPartList`
   - `freePartIfPuzzleMode(part)` — in puzzle/tutorial mode (or type 0x37 Explosives): unlinks and frees; otherwise just clears `g_selectedPart` if it matches
   - `removeFromPartOrder_MAYBE` — removes selected part from puzzle placement queue (shifts array entries up)
-  - `disconnectBeltConnections(part, propagate)` — tears down both belt connection slots; if propagate=1, also disconnects the remote endpoint and clears pulley chains
-  - `disconnectAttachment(part)` — disconnects plug/socket connections (flags3 & 3): for sockets (bit 1), detaches from `connectedParts[0]` and re-inits both parts; for plugs (bit 2), detaches from slots 4–6
+  - `disconnectRope(part, propagate)` — tears down both rope connection slots; if propagate=1, also disconnects the remote endpoint and clears pulley chains
+  - `disconnectPlugConnection(part)` — disconnects electrical plug/socket connections: for plugs (flags3 & 2 == 0), clears `pluggedParts[0]` (the socket target) and the socket's `pluggedParts[plugSlotIdx]` slot; for sockets (flags3 & 2), clears both `pluggedParts` slots and the connected plugs' back-pointers
+  - `updatePlugConnection` — called during drag/placement; finds nearest socket (flags3 & 2) in bg layer within 8px, disconnects old socket if changed, connects to new one via `pluggedParts`/`plugSlotIdx`
 - **Overlap detection:**
   - `isPartOverlappingOthers(part)` → int — checks if part overlaps any existing part on bg+physics layers; skips self, exempt pairs, and parts with flags2 & 0x2000 or flags3 & 0x5000
   - `canTypesOverlap(type_a, type_b)` → int — whitelist of type pairs allowed to coexist: {0xc,0x2a}, {0xc,0x34}, {0x2a,0x34}, {0x2a,0x2a}, {0x36,0x36}, {0x36,0x3a}
-  - `doPolygonsIntersect(part_a, part_b)` → int — edge-by-edge polygon intersection test using shape data at Part+0xd8
+  - `doPolygonsIntersect(part_a, part_b)` → int — edge-by-edge polygon intersection test using `shapeVertices`
   - `doLineSegmentsIntersect(seg1, seg2, out_pt)` → int — line segment intersection via cross-product; `isValueBetween(val, a, b)` — range check helper
   - `setHandleCursor(cursor_id)` — sets cursor appearance for current handle; `g_handleCursorType` (0x477968)
   - `updatePulleyOrientation(part)` — computes angles to both `connectedParts`, averages them, sets quadrant (0-3) as frame + `connPointOffsets`
@@ -172,20 +199,45 @@
   - `atan2Fixed(dx, dy)` → int — fixed-point atan2; 0x1000=full circle, returns `(angle - 0x400) << 4`
   - `atanLookup(ratio)` → int — first-octant lookup from `g_atanTable` (0x471234, `int[512]`)
   - `initPartStates` — iterates all placed parts and initializes their runtime state
-  - `runSimulation` — simulation loop (while `g_gameCommand == 0x2000`): `tickParts`, input, render
-  - `handleSimulationResult` — post-simulation: H2H round logic, puzzle completion, freeform replay
+  - `simulationLoop` — simulation tick loop (while `g_gameCommand == 0x2000`): `tickParts`, input, render
+  - `runSimulation` — top-level: calls `simulationLoop`, then handles result — H2H round logic, puzzle completion, freeform replay
   - `refreshDisplay(incremental)` — full UI refresh + sync: reset state, render, flush, drain input
   - `updateH2hTurn` — checks H2H timer expiry, handles turn switching
 - `g_gameMode` — current game mode:
-  - 0=Freeform, 1=Puzzles, 2=Head-to-head, 6=?, 7=Menu/lobby, 8=Editor
-- `g_gameCommand` (0x4815b0) — loop command: 0x1000=running, 0x2000=transition, 1=quit
+  - 0=Freeform, 1=Puzzles, 2=Head-to-head, 6=Editor (Edit), 7=Menu/lobby, 8=Editor (Test Play)
+- `g_gameCommand` (0x4815b0) — loop command: 0x1000=running, 0x2000=simulation running, 0x200=simulation success, 1=quit
+- `g_pendingGameMode` (0x47798c) — game mode to enter after menu screen (mode 7). Set to 0/1/2/5/6 before `g_gameMode = 7`
+- `g_pendingMenuCommand` (0x0047f92c) — pending command in main menu loop
+- `g_mainMenuWindow` (0x0047f93c) — HWND for the main menu/lobby window
+- `updateToolbar(command_id)` — updates toolbar button states per game mode; -1=refresh without focus change, else highlights specific button
+- `showToolbar(command_id)` (0x4189bc) — creates or updates the toolbar window
+- `setDefaultNavHotspot(hotspot_id)` — sets nav-default flag (0x10) on one hotspot, clears from siblings at same z-order
 - `g_prevEditMode` (0x480a60) — previous frame's `g_editMode`, used to detect transitions (e.g., raise playfield/bin windows)
 - `g_cursorIconCountdown` (0x481590) — frame countdown; while >0, `drawPartIconAtCursor` draws selected part's icon centered on cursor
 - `g_editMode` (0x4815b4) — part interaction mode:
-  - 0=none, 1-2=move, 3-6=resize edges/corners, 7=flip, 8=grab, 9=placing from bin
+  - 0=none, 1=flipX, 2=flipY, 3=resize left, 4=resize right, 5=resize top, 6=resize bottom, 7=drag/move, 8=delete, 9=placing from bin
   - 0xb=toggle direction, 0xc-0xe=special actions, 0x10-0x11=reorder front/back
   - 0x8000 bit=drag active
 - `g_selectedPart` (0x481194) — pointer to the part being interacted with
+- `g_puzzleModified` (0x477950) — dirty flag, set to 1 when the level is modified (part placed/moved, hint edited/dragged, parts locked/unlocked, music changed); cleared by `resetPlayfield`. In editor modes (gameMode 1/6), the close/quit handler shows a "save changes?" dialog when set; also gates `updateScoreDisplay_MAYBE` in `refreshDisplay`
+
+### Hints
+- **HintInfo** — 268-byte (0x10c) struct for persistent hint data: `{int x, y, orientation; char label[256]}`
+  - `g_hints` (0x47eb78) — array of HintInfo, indexed by `(hotspot.id - 21000)`
+- **Hint hotspots** — Hotspot structs representing hint arrows on the playfield
+  - `g_hintHotspots` (0x47f3d8) — array of Hotspot structs for hints
+  - `g_activeHintHotspot` (0x47ea70, Hotspot*) — currently selected hint hotspot; `id` field indexes into `g_hints`
+- `dragHint` (0x42057e) — mouse-drag repositioning of the active hint arrow; enters drag loop until button release, clamps to playfield bounds, updates both the Hotspot position and `g_hints[].x/y`
+- `g_hintModified` (0x472944) — hint edit dirty flag, used by `handleHintEditorCommand`
+- `g_isDraggingHint` (0x472950) — set during `dragHint` drag loop, read by `renderActiveHint`
+- `g_hintDialogAction` (0x47ea6c) — hint dialog state: 0=normal, 1=drag requested (triggers `dragHint` in `showHintDialog`), 2=reopen dialog after drag
+- `g_pendingHintX` (0x47293c) / `g_pendingHintY` (0x472940) — clamped final position after drag
+- `showHintDialog` — opens hint editor dialog (hint.itf); loops on `g_hintDialogAction==2` to allow drag-then-reopen
+- `handleHintEditorCommand` — processes hint editor dialog button commands
+- `initHintHotspot` / `deleteActiveHint` / `renderActiveHint` — hint hotspot lifecycle and rendering
+- `hintEventCallback(hotspot, on_playfield)` — event callback for hint hotspots; handles select, rotate (cycles 0→1→3→2), edit (showHintDialog), delete, drag
+- `hitTestHintHandles()` → int — hit-tests cursor against active hint handles: 0x40=delete, 4=rotate, 0x20=edit, 1=general area, 0=miss
+- `setHintHotspotSurfaces` — binds all 8 hint hotspots to `g_playfieldSurface`
 
 ### Parts
 - **Part pool** — 150 preallocated 0x10C-byte (268) structs, free-list managed
@@ -194,9 +246,9 @@
 - **Part struct** — doubly-linked list nodes across 3 layer lists
   - +0x00 `next`, +0x04 `prev` — linked list pointers
   - +0x08 `typeId` — part type ID
-  - +0x0C `flags1` — bit 0x10=temporary (freed on reset); byte+1: 0x80=uninteractable, 0x20=in bg layer, 0x10=in physics layer
-  - +0x10 `flags2` — bit 0x01=has anim, 0x10=flipX, 0x20=flipY, 0x40=paused; byte+1: 0x20=static/pinned
-  - +0x14 `flags3` — bit 0x01=has connection, 0x40=facing right; byte+1: 0x40=mirrored, 0x20=has overlay
+  - +0x0C `flags1` — bit 0x01=on slope, 0x02=touching surface, 0x04=colliding with part, 0x08=already processed (collision visited), 0x10=temporary (freed on reset); byte+1: 0x80=uninteractable, 0x20=in bg layer, 0x10=in physics layer
+  - +0x10 `flags2` — bit 0x01=has anim, 0x10=flipX, 0x20=flipY, 0x40=paused, 0x80=resizable horizontally; byte+1: 0x01(=0x100)=resizable vertically, 0x20=static/pinned
+  - +0x14 `flags3` — bit 0x01=has connection, 0x02=is socket (plug connections), 0x40=facing right; byte+1: 0x04(=0x400)=has settings dialog, 0x10(=0x1000)=detail-only, 0x40(=0x4000)=mirrored, 0x20(=0x2000)=has overlay, 0x80(=0x8000)=has solve data
   - +0x18 `frame` — current animation frame
   - +0x2C/+0x30 `fixedX`/`fixedY` — 16.9 fixed-point position
   - +0x34/+0x38 `x`/`y` — world position
@@ -210,27 +262,45 @@
   - +0x64/+0x68 `collisionW`/`collisionH` — hitbox dimensions
   - +0x6C/+0x70 `width`/`height` — current sprite dimensions
   - +0x7C/+0x80 `bboxW`/`bboxH` — bounding box (from PartType)
-  - +0x28 `dirtyFlags` (byte) — dirty tracking byte, written by `markPartAndConnectionsDirty_MAYBE`
-  - +0x84 `subAlloc1` / `ropeData` — type-dependent sub-allocation; for ropes (typeId 8) points to `RopeData`; endpoint parts' `subAlloc1` also points to the same `RopeData` instance
-  - +0x90 `connectedParts[2]` — 2-element `Part*` array, indexed by `BeltConnection.connIdx`; slot 0 also used as chain-next for pulleys (typeId 7), slot 1 doubles as `linkedPart` for ropes
+  - +0x28 `dirtyFlags` (byte) — dirty tracking byte, written by `markPartAndConnectionsDirty`
+  - +0x84 `beltData` (BeltData*) — belt/chain connection data; for belts (typeId 8) allocated by belt's createFn; endpoint parts' `beltData` also points to the same instance
+  - +0x90 `connectedParts[2]` — 2-element `Part*` array, indexed by connection index; slot 0 also used as chain-next for pulleys (typeId 7), slot 1 doubles as `linkedPart` for ropes. **Programmable Ball (0x57) hack:** abuses `connectedParts[0]` to store a 16-byte custom physics config block `{mass, elasticity, friction, gravityDir}` instead of a Part*
   - +0x98 `savedConnectedParts[2]` — initial values of `connectedParts` (for reset)
-  - +0xA8 `beltConnections[2]` (`BeltConnection_MAYBE*[2]`) — belt/chain connection data, indexed by connIdx
+  - +0xA0 `pluggedParts[2]` (Part*[2]) — electrical plug/socket connections. On a plug: `[0]` = socket Part* this plug is connected to. On a socket: `[0]`/`[1]` = up to 2 plugs connected to it
+  - +0xA8 `ropeData` (`RopeData*[2]`) — rope connection data, indexed by connIdx
   - +0xB0 `connPointOffsets` (`char[4]`) — signed byte `{dx, dy}` pairs per connection point index; world pos = `part.pos + connPointOffsets[connIdx*2, connIdx*2+1]`
+  - +0xBC `renderNext0` (Part*) — next pointer for first render layer link
+  - +0xC0 `renderNext1` (Part*) — next pointer for second render layer link
+  - +0xD0 `plugSlotIdx` (byte) — which slot (0/1) on the target socket this plug occupies
+  - +0xD1 `renderLayer0` (byte) — render layer index for `renderNext0` (used to select renderNext0 vs renderNext1 during traversal)
   - +0xD4 `framesPerDir` — from PartType
-  - +0xD8 `subAlloc4` — additional sub-allocation (type-dependent, freed in `freePart`)
+  - +0xD8 `shapeVertices` (ShapeVertex*) — collision polygon vertex array (`struct ShapeVertex { int relX, relY; short edgeAngle; }`), count = `framesPerDir`. Positions are relative to part origin. `edgeAngle` precomputed by `computeShapeEdgeAngles`. Used by `doPolygonsIntersect` for edge-vs-edge collision testing
   - +0xE8/+0xEC `savedX`/`savedY` — initial position (for `resetPartStates`)
   - +0xF0 `savedFrame`, +0xF8 `savedFlags2` — initial state (for reset)
-  - +0xC4 `overlapNext` (Part*) — temporary linked list pointer used by `findOverlappingOverlayParts`
+  - +0x24 `actionTrigger` — trigger/action state
+  - +0xC4 `tempNext` (Part*) — temporary linked list pointer used by `findOverlappingOverlayParts` and by `drawAllParts` to chain pipe overlay parts for deferred overlay drawing
+  - +0xC8 `tempDistX`, +0xCC `tempDistY` — overlap distances (used by collision/overlap detection)
+  - +0xDC `collidingPart` (Part*) — the part this one is currently colliding with
+  - +0xE4 `collisionDir` — collision direction
   - +0xFC/+0x100 `aux1`/`prevAux1` — generic per-part runtime slot + dirty tracking snapshot (belt: segment 1 length; overlay: junction code 1)
   - +0x104/+0x108 `aux2`/`prevAux2` — second runtime slot + snapshot (belt: segment 2 length; overlay: junction code 2)
 - **PartType descriptor** — `g_partTypes` (0x4733a0), `PartType *[281]` indexed by type ID
-  - +0x08 `perPartInit` — per-part init function (called by `resetPartStates`)
-  - +0x0C `activatePart` — per-part activate (called by `initPartStates`)
-  - +0x10 `placePart` — per-part placement (called by `initPartStates`)
-  - +0x1C `staticInit` — dual-purpose: per-type init with NULL, per-part create callback with Part*
+  - +0x00 `collisionFn` (CollisionFn: `int (*)(Part *, Part *)`) — collision handler, returns 1 to allow collision. Many parts use `collisionAlwaysAllow` (just returns 1). Part-specific ones like `collisionSharpTool` (Hedge Trimmers/Tin Snips) check blade state + direction
+  - +0x04 `tickFn` (TickFn: `void (*)(Part *)`) — per-frame update function, called from multiple loops in `tickParts` for all eligible parts (not just through `resolveCollision`). Used for AI, animation, rolling physics, etc.
+  - +0x08 `recalculateFn` (RecalculateFn: `void (*)(Part *)`) — recalculates derived part state (shape vertices, edge angles, connection offsets, frame) from current configuration. Called whenever geometry or connections change: init, clone, reset, resize, plug connect/disconnect, placement, deserialization
+  - +0x0C `rotateOrFlipFn` (RotateOrFlipFn: `void (*)(Part *, int)`) — per-part rotate/flip handler. Second arg: 1=flip axis 1 (flags2 & 0x10), 2=flip axis 2 (flags2 & 0x20), 0xf=cycle to next orientation, 0=reset. Default `partDefaultRotateOrFlip` just toggles flag bits; parts with custom orientations (lasers, cannon, thumb tack) cycle through frame values instead
+  - +0x10 `placePartFn` (PlacePartFn: `void (*)(Part *)`) — recalculates part internal state after position/size change; called after modifying x/y/bboxW/bboxH/frame, always followed by `updateRenderPosition`. Used during init, resize, and placement
+  - +0x14 `ropePullFn` (RopePullFn: `int (*)(Part *source, Part *target, int connIdx, uint flags, int weight, int momentum)`) — rope/belt pull handler, called when a rope exerts force on the part. Returns 1 if absorbed. Default `ropePullNoop` returns 0
+  - +0x18 `drawFn` (DrawFn: `void (*)(Part *, int layer)`) — per-type draw function, called by `drawPart`
+  - +0x1C `createFn` (CreatePartFn: `int (*)(Part *)`) — per-part create callback, returns success (checked against 0). Allocates type-specific data (e.g., custom physics blocks)
+  - +0x20 `renderLayers` (2 bytes) — render layer indices (0-8) for z-ordered drawing; 0xFF = unused. Parts can appear in up to 2 render layers
   - +0x24 `framesPerDirection`, +0x28/+0x2C/+0x30 `defaultFlags1`/`2`/`3`
-  - +0x34/+0x38 `bboxWidth`/`bboxHeight`, +0x50 `weight`, +0x60 `maxVelocity`
-  - +0x64/+0x68 collision offsets, +0x6C `frameData` pointer (allocated by `loadPartParams`)
+  - +0x34/+0x38 `bboxWidth`/`bboxHeight`
+  - +0x3C `maxBboxW`, +0x40 `maxBboxH`, +0x44 `minBboxW`, +0x48 `minBboxH` — resize limits for parts with resizable bounding boxes
+  - +0x50 `weight`
+  - +0x54 `elasticity`, +0x58 `friction`, +0x5C `gravityDir_MAYBE`
+  - +0x60 `maxVelocity`
+  - +0x64/+0x68 collision offsets, +0x6C `shapeData` (ShapeVertex**): per-direction shape vertex arrays (allocated by `loadPartParams`)
 - **Layer system** — 3 doubly-linked lists, each a separate z/processing layer:
   - `g_bgPartList` (0x48117c) — background/trigger layer (mask 0x2000): animated/reactive but no physics
   - `g_physicsPartList` (0x481184) — physics layer (mask 0x1000): collision, gravity, movement
@@ -243,58 +313,70 @@
   - `relinkPartInLayer(part)` — unlinks + re-inserts into bg/physics list based on `flags1 & 0x4000`
   - `compareFgTypePriority(type_a, type_b)` — fg layer sort: returns whichever typeId ranks higher in `g_fgTypePriorityTable` (0x47201c)
   - `snapshotAllParts` / `snapshotPartState` — copy current pos/render/dims/frame/state into prev fields for dirty tracking
-  - `tickParts` — simulation tick: processes bg layer (triggers), then physics layer (multiple collision/gravity passes), then dirty-checks all layers
+  - `tickParts` — simulation tick: processes bg layer (triggers), then physics layer (multiple collision/gravity passes), then calls `tickFn` for eligible parts in multiple loops, then dirty-checks all layers
   - `checkPartCollisions(part)` — collision detection/resolution against all parts (**`__fastcall` misdetection** — needs manual `__cdecl` fix)
+  - `resolveCollision(part)` — main collision resolution: sets visited flag (0x8), recurses on linked parts, dispatches based on flags1 collision bits:
+    - 0x1 (on slope) → `resolveSlopeBounce`
+    - 0x2 (touching surface) → `resolveSurfaceBounce`
+    - 0x4 (colliding with part) → `resolvePartPartCollision` (calls PartType `collisionFn`, then `getBounceType` to dispatch to `tickFn` for ball-type parts)
+  - `getBounceType(part)` → int — returns bounce behavior class: 0=none, 1=standard ball, 2=bowling ball, 3=rolling (programmable ball frames 5-20). Only returns non-zero for ball types (0x0, 0x9, 0x1c, 0x2c, 0x2d, 0x44, 0x57)
+  - `getPartPhysicsProps(part, out_elasticity, out_friction)` — reads from PartType fields; Programmable Ball (0x57) reads from custom block at `connectedParts[0]` instead
+  - `angleBetweenParts(part_a, part_b)` → int — angle between two parts using `rotateVector`/`cosFixed`/`sinFixed`
+  - `applyExplosion(center_x, center_y, blast_radius, blast_force)` — area-of-effect: finds overlapping parts via `findOverlappingPartsByPoint`, applies radial velocity impulse, chain-detonates nitroglycerine via `detonateNitro`
+  - `findOverlappingPartsByPoint(x, y, radius)` / `findOverlappingPartsByBBox(x1, y1, x2, y2)` — spatial queries for collision/explosion detection
   - `imul16(a, b)` → longlong — 16×16→32 signed multiply (compiler helper, used in fixed-point math)
+  - `rotateVector(dx, dy, angle, out_x, out_y)` — 2D vector rotation using `cosFixed`/`sinFixed`
+  - `cosFixed(angle)` / `sinFixed(angle)` — fixed-point trig lookup
+  - **Notable type IDs:** 7=Pulley, 8=Belt, 10=Rope, 0x1b=Captain Z Super Phazer, 0x25=Hedge Trimmers, 0x31=Chain Link, 0x3f=Pool Ball, 0x4C=Steel Cable, 0x4D=Tin Snips, 0x57=Programmable Ball, 0x5F=Laser Mixer, 0x6B=Electric Mixer, 0x7f=Color Block, 0x88=Message Computer
 - **Part lifecycle:** `allocPart` → `initPart` → `initPartStates` → (gameplay) → `resetPartStates` → `freePart`
+- **Part serialization:** `readPartListFromStream(stream, list_head, count)` → `readPartFromStream(stream, part)` — reads part fields from level file (typeId, flags, dimensions, saved state, belt/rope/connection data, type-specific extras), then calls `recalculateFn`
 - `resetPartStates` — restores all parts to saved initial state (positions from +0xE8/+0xEC, flags from +0xF8)
 - `initPlayfield` — clears edit state + `resetPartStates` (called once at game start)
 - `prepareSimulation` / `resetAfterSimulation` — bracket `runSimulation`
 - `g_partAnimations` (0x480b48) — animation handles per type ID, `int[281]`
-- **BeltConnection_MAYBE** — 0x54-byte (21-int) struct for belt/chain connections between parts
+- **RopeData** — 0x54-byte (21-int) struct for rope connections between parts (stored at Part+0xA8 `ropeData`)
   - +0x00 `owner` (Part*), +0x04 `part1` (Part*), +0x08 `part2` (Part*)
   - +0x0C `savedPart1`, +0x10 `savedPart2` — initial values for reset
   - +0x14 `connIdx1`, +0x15 `connIdx2` (char) — connection point indices on part1/part2
   - +0x16 `savedConnIdx1`, +0x17 `savedConnIdx2` (char) — initial values for reset
   - +0x24 `endpoint1` (Point), +0x2C `endpoint2` (Point) — world-space connection positions
-  - +0x34 `cachedPt1`, +0x3C `cachedPt2` (Point) — dirty tracking pair 1
-  - +0x44 `prevPt1`, +0x4C `prevPt2` (Point) — dirty tracking pair 2
-  - `updateBeltEndpoints(belt)` — recomputes endpoint positions from part positions + `connPointOffsets`
-  - `getBeltPartner(part, belt)` → Part* — returns the other part on a belt connection
-  - `measureBeltSpan(belt, part, out_dx, out_dy)` → int — octagonal distance approximation between belt endpoints
-  - `measureBeltSegment(belt, flags, side)` → int — measures full belt segment length
-  - `propagateBeltMotion(part)` → int — belt tension propagation: computes slack, pushes lighter target parts, handles chain link consumption (type 0x31), updates position along belt vector
-  - `getBeltApproachFlags(belt, side, direction)` → uint — direction/wrap bitmask for belt segment interaction
+  - +0x34 `prevEndpoints` (Point[4]) — dirty tracking: [0]/[1] snapshotted from endpoint1/endpoint2 by `snapshotPartState`; [2]/[3] used by `addChainedConnectionDirtyRects` for part2 side in transition mode
+  - `updateRopeEndpoints(rope)` — recomputes endpoint positions from part positions + `connPointOffsets`
+  - `getRopePartner(part, rope)` → Part* — returns the other part on a rope connection
+  - `measureRopeSpan(rope, part, out_dx, out_dy)` → int — octagonal distance approximation between rope endpoints
+  - `measureRopeSegment(rope, flags, side)` → int — measures full rope segment length
+  - `propagateRopeMotion(part)` → int — rope tension propagation: computes slack, pushes lighter target parts, handles chain link consumption (type 0x31), updates position along rope vector
+  - `getRopeApproachFlags(rope, side, direction)` → uint — direction/wrap bitmask for rope segment interaction
   - `syncVelocityFromPosition(part, shift_x, shift_y, axis_mask)` — derives velocity from position delta, converts to 16.9 fixed-point
   - `clampVelocity(part)` — clamps velocityX/Y to ±PartType.maxVelocity
-- **RopeData** — 0x50-byte struct for rope connections (typeId 8), pointed to by `subAlloc1` on both the rope owner and endpoint parts
+- **BeltData** — 0x50-byte struct for belt connections (typeId 8), pointed to by `beltData` (Part+0x84) on both the belt owner and endpoint parts
   - +0x00 `field_0x00` (int) — unknown
-  - +0x04 `owner` (Part*) — back-pointer to rope part
+  - +0x04 `owner` (Part*) — back-pointer to belt part
   - +0x08 `endpoint1` (Part*), +0x0C `endpoint2` (Part*) — connected parts
-  - +0x10 `line1Start` (Point), +0x18 `line1End` (Point) — rope edge A (tangent points on endpoint circles)
-  - +0x20 `line2Start` (Point), +0x28 `line2End` (Point) — rope edge B
+  - +0x10 `line1Start` (Point), +0x18 `line1End` (Point) — belt edge A (tangent points on endpoint circles)
+  - +0x20 `line2Start` (Point), +0x28 `line2End` (Point) — belt edge B
   - +0x30/+0x38/+0x40/+0x48 — dirty tracking snapshots of the above (copied by `snapshotPartState`)
-  - `updateRopeGeometry(rope)` — computes tangent points from endpoint positions + radii
-  - `canConnectRope(rope)` → int — checks if rope can connect (distance or cursor target)
-  - `arePartsInRopeRange(a, b)` → int — dist² < 0x4C90 (~140px range)
-  - `disconnectRope(rope_part)` — detaches both endpoints, clears their `subAlloc1`
+  - `updateBeltGeometry(belt)` — computes tangent points from endpoint positions + radii
+  - `canConnectBelt(belt)` → int — checks if belt can connect (distance or cursor target)
+  - `arePartsInBeltRange(a, b)` → int — dist² < 0x4C90 (~140px range)
+  - `disconnectBelt(belt_part)` — detaches both endpoints, clears their `beltData`
 - **Pipe overlay system** — parts with `flags3 & 0x2000` ("has overlay") display junction sprites where they connect to neighboring pipes
   - `updateOverlays(part)` — NULL=update all bg overlay parts, else update one; dispatches to pipe vs large pipe
   - `isPipeType(part)` → int — checks typeId ∈ {1, 0x2e, 0x30, 0x38, 0x3c, 0x52–0x55, 0x7d}
   - `updatePipeOverlay(part)` → int — probes adjacent parts, sets `aux1`/`aux2` junction codes (16px pipes)
   - `updateLargePipeOverlay(part)` → int — same for type 0x76 (32px pipes), also checks flip state
-  - `findOverlappingOverlayParts(part, layer_mask, x1, x2, y1, y2)` — spatial query, builds temp linked list at Part+0xC4 (`overlapNext`)
+  - `findOverlappingOverlayParts(part, layer_mask, x1, x2, y1, y2)` — spatial query, builds temp linked list at Part+0xC4 (`tempNext`)
   - `addOverlayDirtyRects(part, flags)` — dispatches to `addPipeOverlayDirtyRects` or `addLargePipeOverlayDirtyRects`
   - Junction codes (1–12): encode side (above/below/left/right) + alignment (flush/offset) for each pipe end
 - **Connection rendering:**
-  - `addConnectionDirtyRects(part, flags)` — dirty rects for connections the part is an endpoint of (walks to belt owner)
-  - `addPartDirtyRects(part, flags)` — dirty rects for what the part owns: rope→`addRopeDirtyRects`, belt→`addChainedConnectionDirtyRects`, else→`addBboxDirtyRects`
+  - `addConnectionDirtyRects(part, flags)` — dirty rects for connections the part is an endpoint of (walks to rope owner)
+  - `addPartDirtyRects(part, flags)` — dirty rects for what the part owns: belt→`addBeltDirtyRects`, rope→`addChainedConnectionDirtyRects`, else→`addBboxDirtyRects`
   - `addBboxDirtyRects(part, flags)` — adds bounding box dirty rects (current/prev position by flags)
-  - `markPartAndConnectionsDirty_MAYBE(part, flags)` — sets dirty byte at Part+0x28, propagates to connections, updates belt endpoints
+  - `markPartAndConnectionsDirty(part, flags)` — sets dirty byte at Part+0x28, propagates to connections, updates rope endpoints
   - `g_suppressDirtyRects` (0x481024) — when non-zero, all dirty tracking functions early-out
-  - `getPartInteractionRect(part, out_rect)` — computes clickable rect: default=collision box, rope=endpoint circle, belt=connection point area
-  - `addRopeDirtyRects(part, flags)` — straight-line dirty rects from `subAlloc1` endpoints
-  - `addChainedConnectionDirtyRects(part, flags)` — walks belt chain, adds curved-line dirty rects
+  - `getPartInteractionRect(part, out_rect)` — computes clickable rect: default=collision box, belt=endpoint circle, rope=connection point area
+  - `addBeltDirtyRects(part, flags)` — straight-line dirty rects from `beltData` endpoints
+  - `addChainedConnectionDirtyRects(part, flags)` — walks rope chain, adds curved-line dirty rects
   - `addCurvedLineDirtyRects(pt1, pt2, flags, sag)` — bezier-subdivided dirty rects with sag
   - `drawConnectionLine(x1, y1, x2, y2, sag)` — renders rubber-band line (straight or curved)
   - `drawShadedLine(x1, y1, x2, y2)` — 3-pixel-wide shaded line with color triple from colorKey
@@ -306,33 +388,100 @@
 - `g_h2hTimerActive` — 1=running, 0=paused
 - `g_h2hCurrentPlayer` — 0 or 1, toggled each round
 - `g_h2hPlayer1Wins` / `g_h2hPlayer2Wins` — round win counts
-- `g_h2hPlayer1TimeLimit` / `g_h2hPlayer2TimeLimit` — ms per turn
-- `g_h2hRoundsToWin` — best-of-N threshold
+- `g_h2hPlayer1TimeLimit` / `g_h2hPlayer2TimeLimit` — ms per turn (default 45000)
+- `g_h2hRoundsToWin` — best-of-N threshold (default 3, range 1-9)
+- `g_h2hPlayer1Name` (0x47e6dc) / `g_h2hPlayer2Name` (0x47e6e7) — 10-char name buffers, defaults from strings 0x834/0x835
+- `g_h2hSavedRoundsToWin` (0x472840) / `g_h2hSavedPlayer1TimeLimit` (0x472844) / `g_h2hSavedPlayer2TimeLimit` (0x472848) — persistent settings across dialog invocations
+- `g_h2hPreviousPlacedPart` (0x4815bc) — previous turn's placed part (for move validation)
+- **Setup dialog** — `showH2hSetupDialog` → `hedtohed.itf`, proc `h2hSetupDlgProc`
+  - `h2hSetupOnCommand` — button handler: OK validates non-empty names, Cancel sets `g_h2hSetupResult=2`
+  - `h2hSetupUpdateDigit` / `h2hSetupRefreshDisplay` — update digit displays for rounds/time
+  - `g_h2hSetupResult` (0x47e6f4) — 0=pending, 1=OK, 2=cancel
+  - `g_h2hSetupNavOrder` (0x472850) — `int[11]` null-terminated tab order
+  - `g_h2hEditBrush` (0x47284c) — `HBRUSH` for name edit control backgrounds
+  - Time limits adjustable ±5s (range 10s-90s)
+- `formatH2hStatus` — formats win count status message, shows dialog; returns int (0=replay, nonzero=continue)
 - `confirmH2hPlacement(part)` — moves part from pending to placed when confirmed
 - `g_h2hPlacedPart` (0x4815b8) — Part* successfully placed this turn (cleared on sim/turn end)
 - `g_h2hPendingPart` (0x4815c0) — Part* currently being placed by current player
+- `g_h2hFirstRound_MAYBE` (0x4815c4) — set to 1 in H2H init, written by `runSimulation` and `showH2hSetupDialog`
 - `updateH2hTurn` — checks timer expiry, switches player, resets deadline, shows turn dialog
 - `h2hForceDropSelectedPart` — on timer expiry, forces player to give up the held part:
-  - Connection parts (Belt, Rope, Steel Cable) and paired parts (Remote Control + Explosives): deleted outright (incomplete state)
+  - Connection parts (Rope, Belt, Steel Cable) and paired parts (Remote Control + Explosives): deleted outright (incomplete state)
   - Parts being placed (editMode 9) that overlap: deleted
   - Parts being placed that don't overlap: dropped in place via forced button-up
   - Parts being dragged (editMode & 0x8000): forced button-up cancels drag
   - Clears `g_selectedPart` in all cases
 
 ### Puzzle System
-- **Save file** — `TIM.SAV`, loaded by `loadPuzzleState`, written by `savePuzzleState`
-  - Format: header string, 0x1A separator, level names, settings, section bounds, completion flags, checksum
+- **Save file** — `TIM.SAV` (default, "Guest" profile) + `tim01.sav`–`tim99.sav` (named profiles)
+  - Format: header string, 0x1A separator, profile name, last profile name, settings, section bounds, completion flags, checksum
   - Checksum: sum of all bytes after header = 0x4D ('M')
-- **Puzzle state struct** at `g_puzzleState` (0x4803d4):
-  - +0x00: level name (20 bytes), +0x14: level name 2, +0x2c: total count, +0x30: current index
+  - `loadPuzzleState` / `savePuzzleState` — read/write save files
+  - `readSaveProfileName(path)` — reads profile name (field 1) from any save; substitutes `g_defaultProfileName` for TIM.SAV
+  - `loadLastProfileName` — reads `g_lastProfileName` (field 2) from TIM.SAV; used by sign-in to pre-select last player
+  - `saveLastProfileName` — writes `g_profileName` into TIM.SAV field 2 (only when current save is not TIM.SAV)
+- **Puzzle state struct** at 0x4803d4:
+  - +0x00: `g_profileName` (char[20]) — current profile name (default "Guest", localized)
+  - +0x14: `g_lastProfileName` (char[20]) — last signed-in profile name (only meaningful in TIM.SAV)
+  - +0x28: machine fingerprint, +0x2c: total count, +0x30: current index
   - +0x34: `g_difficultyBounds[7]` — fencepost boundaries for 6 difficulty tiers
   - +0x50: volume, +0x51: music enabled, +0x52: sfx enabled
   - +0x53: puzzle completion flags (1 byte per puzzle, up to 250)
 - **Difficulty tiers** — 206 puzzles in 6 groups:
   - 0=Tutorial(40), 1=Easy(26), 2=Medium(30), 3=Hard(31), 4=Expert(29), 5=H2H/Bonus(50)
 - `g_currentPuzzle` (0x481600) — runtime puzzle index
-- `openPuzzleSet` / `selectPuzzle` / `markPuzzleComplete` / `getCurrentSection`
-- `g_defaultLevelName` (0x481c70) — fallback level name from puzzle set header
+- `g_currentDifficulty` (0x477990) — which difficulty band `g_currentPuzzle` falls into
+- `g_puzzleIndexInDifficulty` (0x481604) — `g_currentPuzzle - g_difficultyBounds[g_currentDifficulty]`; used in h2h to avoid re-picking same puzzle
+- `g_selectedDifficulty` (0x481918) — copy of `g_currentDifficulty` set by `selectPuzzle`, tracks UI difficulty selection
+- `createSaveFile(save_path, profile_name)` — initializes a fresh save: hardcodes difficulty bounds, resets state, clears completion flags, saves to disk. Called as fallback by `loadPuzzleState` when save is missing/corrupt, and by `handleSignInCommand` to create new profiles
+- `selectPuzzle` / `markPuzzleComplete` / `getCurrentSection`
+- `getPuzzleCountForDifficulty(level)` — returns `g_difficultyBounds[level+1] - g_difficultyBounds[level]`
+- `isDifficultyComplete(difficulty)` → int — returns 1 if all puzzles in the tier are completed
+- `loadPuzzle(filename, game_mode)` — resets playfield, loads level file, resets parts, sets game mode, plays music
+- `gameRand` (0x4520a4) — lagged Fibonacci PRNG (0x38-entry array, two indices), returns 16-bit random value
+- `g_defaultProfileName` (0x481c70) — `char*` → SYSTEM.RES string 3 ("Guest"), default profile name (localized)
+- `isDefaultProfile` — checks `stricmp(g_profileName, g_defaultProfileName) == 0`
+- `restoreDefaultProfileName` — copies `g_defaultProfileName` to `g_profileName` and saves; called on language change when profile was default
+- **Sign-in system** — `buildSignInList` iterates all `TIM*.SAV` files, reads profile names via `readSaveProfileName`, builds list for sign-in dialog
+  - `handleSignInCommand` — sign-in dialog command handler: loads selected profile, creates new profiles, calls `saveLastProfileName` after sign-in
+  - `g_signInPlayerName` / `g_signInPlayerIndex` / `g_signInConfirmed` — sign-in dialog state
+  - `signInListClick(hotspot, event)` — hotspot click handler for player list; converts cursor Y to list index, updates selection
+  - `drawSignInList(hotspot)` — draws player name list using `layoutText`/`drawFormattedText`; highlights selected player
+  - Sign-in list rendering reuses a TextCtrl at 0x0047fdf4 whose tail (text/textLen/secondaryFont at 0x0047fe14–0x0047fe1f) overlaps `g_solveEntries[0]` — shared memory, both dialogs can't be open simultaneously
+- **Solve system** — defines per-part solution criteria; `checkSolveConditions` runs each frame from `simulationLoop`
+  - **SolveEntry struct** (0x20 bytes): `{Part *part, frameStart, frameEnd, count, x, y, w, h}`
+  - `g_solveEntries` (0x0047fe14) — `SolveEntry[9]`, entry 0 is unused (sentinel/shared with sign-in data), real entries at indices 1–8
+  - `findSolveEntryIndex(part)` → int — searches entries 1–8 for matching Part pointer; returns index (1–8) or 0 if not found
+  - `checkSolveConditions()` → int — called from `simulationLoop`: 0=no solve data, 1=not solved, 2=solved
+    - First checks all foreground parts are gone from solve list
+    - Then iterates physics + background parts, checking each against its solve entry:
+      - Frame range: `frameStart <= part->frame <= frameEnd`
+      - Position: part center within `{x, y, w, h}` rect; `w == -1` = off-screen check (center outside 640×400)
+      - Count: if `count > 0`, requires exactly that many matching parts of same type
+    - Solution must hold for `g_solveFrameValue` frames (tracked by `g_solveHoldFrameCount` at 0x00477934)
+  - **Solve dialog** (`solve.itf`, string group 6000 `solve.res`) — configures solution criteria per part
+    - `showSolveDialog` — entry point, loops showing the dialog; restores gravity state on exit
+    - `solveDialogProc` — DlgProc: handles WM_INITDIALOG, WM_COMMAND (edit validation), WM_CTLCOLOREDIT (white-on-blue), custom 0x2400 (hotspot clicks)
+    - `initSolveDialogState` — populates dialog from solve entry data
+    - `solveDialogHandleClick` — dispatches hotspot button clicks (help, done, mode toggles)
+    - `solveDialogAction` — saves data and dispatches actions via jump table
+    - `configureSolveDialogControls` — enables/disables controls based on part type and `g_solveAdvancedMode`; labels SO_ADVANCED button "Advanced"/"Normal"
+    - Solution modes (radio toggles): Not Solve (0x4a44), Top (0x4a45, y=-2000), Bottom (0x4a4d, y=400), Off Screen (0x4a4e, w=-1), Position (0x4a5f, custom rect), Count (0x4a60), Frame (0x4a5e)
+    - Edit controls: SO_COUNT_DATA (0x4a64, max 2 chars) for count, SO_FRAME_DATA (0x4a65, max 4 chars) for frame hold count
+    - `g_solveAdvancedMode` (0x00472f98) — persisted in save file via `getSolveAdvancedMode`/`setSolveAdvancedMode`; controls whether advanced solve criteria (count/frame/position) are shown
+    - `g_solveNavOrder` (0x00472fb0) — `int[15]`, hotspot tab order for the dialog
+    - Dialog state globals: `g_solvePartIndex`, `g_solveSavedPart`, `g_solveSavedZOrder`, `g_solveGravityModified`, `g_solveDialogResult`, `g_solveSuppressEditNotify`, `g_solveEditBrush`, `g_solveCountEditHwnd`, `g_solveFrameEditHwnd`, `g_solveCountText`, `g_solveFrameText`, `g_solveFrameValue`
+  - **Animation preview** (SO_ANIM, hotspot 0x4a57) — displays part animation in the solve dialog
+    - `initSolveAnimPreview` — loads part animation, centers in hotspot, sets up callbacks
+    - `drawSolveAnimPreview(hotspot)` — draw callback: clips to hotspot bounds, fills background (colorKey 0xb), draws current frame
+    - `tickSolveAnimPreview(hotspot, event)` — event callback: advances frames, handles looping between primary/secondary animations with delays
+    - `drawSolveDialogText(hotspot)` — draw callback for SO_TITLE (part name, right-aligned shadowed) and SO_STATE_TEXT (current state description)
+  - **Solve string data** (string group 6000, `solve.res`) — per-part-type sections delimited by `'!'` lines
+    - `findStringSection(group_id, delimiter, occurrence)` → int — finds Nth delimiter-prefixed section in a string group; returns string ID of first data string (+2 past delimiter)
+    - `parseSolveFrame(string_id, get_end)` → uint — parses solve string entry (format: `[@]eventStart,eventEnd[E]`), converts event IDs to animation frame numbers via `getAnimEventFrame`; `get_end=0` for start frame, `get_end=1` for end frame
+    - `loadPartSolveData(part)` — loads/validates solve entry data for a part from string group 6000
+  - `atoi_DUP` (0x00464db4) — duplicate `atoi` from different CRT module (uses char class table for whitespace)
 
 ### Animation System
 - **TB format** — `PART_%d.ANM` files with 'TB' magic header
@@ -364,8 +513,15 @@
 ### Localization
 - `initLanguage` — reads `[Language]` from `timwin.ini`, loads localized resources
 - `loadLocalizedMenu` — loads language-specific menu resource (Tim2MenuS/I/G/F/default)
-- `loadLanguageResources` — reloads keyboard map, cursor hotspots, system strings for new language
+- `loadLanguageResources` — reloads keyboard map, cursor hotspots, system strings for new language; saves setting to INI; resets puzzle if language was already active
+- `loadLanguageResourceMap(path)` — loads `.dat` language resource overlay file; validates 4-byte magic + version 1 header, adds resource entries to resource table at slot `g_resourceCount + 1`; returns 1 on success
 - `loadSystemStrings` — loads `SYSTEM.RES` (up to 11 system message strings)
+- `saveLanguageSetting` — strips extension from `g_langFilePath`, writes to `[Language] LANG=` in `timwin.ini`
+- `resetPuzzleToDefault` — copies `g_defaultLevelName` to `g_puzzleSetLevelName`, calls `savePuzzleState(NULL)`; called when language changes while already active
+- **Keyboard map** — `KEYBOARD_MAP` resource, loaded as null-terminated string table (CR→`\0`, LF stripped, double-null terminated)
+  - `loadKeyboardMap(resource_name)` / `freeKeyboardMap` — load/free `g_keyboardMapData` (0x490040)
+  - `translateKeyboardInput(key, flags)` — sequence-matching lookup; `\x01`=wildcard, `\x02`=swallow (return `\0`); builds multi-key sequence buffer, searches for match
+- `g_langFilePath` (0x480372) — `char[14]`, current language data filename (e.g. `ENGLISH.dat`)
 - `g_languageCode` — single char: 'S'=Spanish, 'I'=Italian, 'G'=German, 'F'=French, 'E'=English
 
 ### INI System
@@ -378,20 +534,24 @@
   - `next`, `prev`, `id`, `controlType`, `zOrder`, `cursorType`, `x`, `y`, `width`, `height`
   - `drawCallback`, `eventCallback`, `flags`, `userData`, `surface`
 - `addHotspot` / `removeHotspot` / `findHotspot` / `dispatchHotspotEvents` / `drawHotspots`
-- `setHotspotFlags` / `setHotspotCallbacks` / `setHotspotNavigation` / `reassignHotspot`
-- `setHotspotUserData` / `replaceSurfaceInHotspots` / `fitHotspotToSurface`
+- `setHotspotFlags` / `clearHotspotFlags` / `setHotspotCallbacks` / `setHotspotNavigation` / `setHotspotLabel` / `reassignHotspot`
+- `setButtonEnabled(hotspot_id, enabled)` — enables/disables a toggle control (controlType 3); sets toggle state and redraws
+- `setHotspotUserData(id, z_order, user_data)` → int (old userData) — sets userData on hotspots; z_order=0 finds by ID, otherwise iterates all matching z_order
+- `replaceSurfaceInHotspots` / `fitHotspotToSurface`
 - Globals: `g_hotspotListHead` / `g_hotspotListTail` / `g_currentHotspot` / `g_focusedHotspot`
 - `g_hotspotListDirty` / `g_hotspotListModified`
 - **Tab order** — `g_tabOrder` (0x48f73c), 512-entry array of navigable hotspot IDs
   - `g_tabFocusId` (0x48ff3c) — currently keyboard-focused hotspot
   - `navigateTabOrder` / `isInTabOrder` / `removeFromTabOrder` / `setHotspotNavigation`
 - Flags: bit 0x1=needs callback, 0x4=dirty-cleared, 0x8=disabled, 0x10=nav default, 0x20=nav exit
+- **Embedding pattern** — Hotspot is often embedded as the first member of larger structs: `{Hotspot, ItfControlBase, <type-specific data>}`. Standalone Hotspots (no ItfControlBase) have zero at offset 0x40 (where `animHandle` would be). Code like `getHotspotBounds` relies on this to detect whether animation data follows
+- `getHotspotBounds(hotspot_id, mode, out_rect)` → int — computes bounding rect for a hotspot, including animation frame bounds from ItfControlBase if present. Mode: 0=union all siblings at same z-order, -1=merge into existing rect, other (e.g. 1)=single hotspot fresh
 
 ### Input System
 - `handleInputMessage` — Win32 WndProc for mouse/keyboard, writes to raw accumulators
 - `snapshotInputState` — copies raw input to current-frame state
 - `pollInput` — snapshots + promotes right-click to left-click, updates cursor, defocuses hotspot
-- **Mouse buttons** — per-button state words, bit 1=held, bit 2=click event, bit 4=double-click
+- **Mouse buttons** — per-button state words: bit 1=held, bit 2=just pressed (rising edge), bit 4=held down, bit 8=double-click; `& 6` = pressed or held, `== 0` = not pressed
   - `g_leftButton` / `g_rightButton` — snapshotted (read by game logic)
   - `g_leftButtonRaw` / `g_rightButtonRaw` / `g_middleButtonRaw` — accumulators (middle is dead code)
 - `g_cursorX` / `g_cursorY` — snapshotted cursor position
@@ -409,6 +569,13 @@
 
 ### UI
 - `createMainWindow` / `createChildWindow` / `destroyChildWindow`
+- `createPlayfieldWindow` — creates playfield child window; reads position/size from INI `[PlayField]` with resolution-dependent defaults
+- `createPartBinWindow` — creates part bin child window; loads `WPARTBIN.BMP`, reads layout from INI `[PartBin]`
+- `createH2hWindow` — creates H2H status window (gameMode==2 only); reads layout from INI `[HeadToHead]`
+- `repaintSurface(surface)` — blits entire surface to screen (0, 0, width, height)
+- `g_partBinSurface` (0x480fd0) — Surface* for the part bin window
+- `g_partBinFilterMode_MAYBE` (0x0047794c) — part bin display state, set alongside category changes, read by `layoutPartBin` and `hitTestPartAtCursor`
+- `g_levelEditNoticeShown` (0x481004) — one-shot flag: shows info dialog first time entering level editor in puzzle mode
 - `showDialog` — loads `.itf` (Sierra interface format) or standard Win32 dialog resources
   - ITF path: loads ITF as hotspot surface, builds an in-memory `DLGTEMPLATE` via `buildDialogTemplate`, shows with `DialogBoxIndirectParamA`
   - Non-ITF path: standard `DialogBoxParamA` with resource name
@@ -424,11 +591,22 @@
   - `descriptionEventCallback(event)` — tracks cursor over hotspots, matches hotspot ID to description entries via `atoi`
   - Globals: `g_descTargetHotspot`, `g_descStringIndex`, `g_descDelay` (30-frame countdown), `g_descEraseCountdown`, `g_descX/Y/Width/Height`, `g_descCooldown`, `g_descText`
 - **UI labels** — stored in `INTRFACE.RES`, string group 2000, used for buttons/categories/dialog text
-  - `formatUiLabel(label_code, out_scale, out_font, out_flags, out_color)` — looks up string by code, parses `~` escape markup (`~C`=color, `~JL/JC/JR`=justify, `~S`=scale, `~F`=font)
-    - `label_code` encoding: ten-thousands=scale, thousands=`g_interfaceResources` index (0=corners bitmap, 1+=fonts), units (mod 1000)=string index in group 2000
+  - **Label code format** — packed integer `SSFNNN`: `SS`=scale/text renderer ID (code/10000), `F`=font index into `g_interfaceResources` ((code/1000)%10), `NNN`=string index (code%1000) → `getString(NNN + 2000)`. Example: 31114 → scale=3, font=`g_interfaceResources[1]`, string=`getString(3114)`
+  - `formatUiLabel(label_code, out_scale, out_font, out_flags, out_color)` — decodes label code, looks up string, parses `~` escape markup (`~C`=color, `~JL/JC/JR`=justify, `~S`=scale, `~F`=font)
+  - Special string indices (code % 1000): 0x62/0x63=player names, 0x64/0x65=hardcoded strings 0x837/0x838, 0x78/0x74/0x75/0xc1=format strings via `sprintf`, 0x9a=H2H status buf, 0xa1=part info (tab-delimited field)
   - `g_interfaceResources` (0x47f61c) — `int[10]`: [0]=corners bitmap, [1+]=interface fonts
   - `initInterface` — loads INTRFACE.RES string group 2000, corners bitmap, fonts
-- **Generic dialog** — `showGenericDialog(message_id, dialog_id, button1_code, button2_code)` → 1=button1, 0=button2, -1=cancel; uses `generic.itf`
+- **Generic dialog** — `showGenericDialog(title_string_id, body_string_id, button1_string_id, button2_string_id)`
+  - `title_string_id` — getString ID for window caption; 0 → falls back to `getString(0x959)` (generic title). Note: this is a raw getString ID, NOT a label code
+  - `body_string_id` / `button1_string_id` / `button2_string_id` — these are **label codes** (SSFNNN format), not raw string IDs. They are set on hotspots via `setHotspotLabel` and decoded by `formatUiLabel` during drawing
+  - `body_string_id` — if 0, returns 2 immediately (no dialog shown)
+  - `button1_string_id` / `button2_string_id` — 0 = hide that button
+  - Button code transformation: `code % 10000 + 30000` → normalizes into label code range (forces scale=3, preserves font+string; identity for codes already 30000–39999)
+  - Returns: 1=button1 clicked, 0=button2 clicked, -1=dismissed/both hidden, 2=no dialog (body_string_id==0)
+  - NUL-separated string trick: `sprintf(buf, "generic.itf %s", title); buf[11]='\0'` → produces `"generic.itf\0Title Text"`. `showDialog` loads the ITF from the first part, reads window caption from after the NUL (when `WS_CAPTION`/0xC00000 is set)
+  - Dialog proc (`genericDialogProc`): hotspot 65000=dialog surface, 0xFDEC=body text, 0xFDE9=button1, 0xFDEA=button2. Single-button mode centers it; both-hidden mode returns -1
+  - `setHotspotLabel(hotspot_id, label_code)` — writes label code to offset 0x44 (`ItfControlBase.baseFrame`) of a hotspot; used by dialog proc to assign text to body/buttons
+  - Sound queue disabled during dialog (`setSoundQueueMode(0/1)`), font reset after (`setFont(-1)`)
 - **ITF file format** — Sierra interface files (`.itf`), IFF chunk tag `"ITF:"`, `"TB"` magic, versioned
   - `loadItfFile(resource_name, flags)` → z-order; flags: bit 0=create surface, bit 1=align to dialog units, bit 2=recenter coords
   - `destroyHotspotGroup(hotspot_id, z_order)` — tears down all hotspots at a z-order, frees animations
@@ -439,13 +617,22 @@
   - `g_itfVersion` (0x47bd44) — version from current ITF file (affects field parsing)
   - `g_itfChunkTag` (0x470078) — `"ITF:"` chunk tag constant
 - **ITF control dispatch table** — `g_itfControlDispatch` (0x47016c), 7 entries × 20 bytes, indexed directly by ITF control type ID
-  - Entry: `{initProc, proc2, drawProc, eventProc, extraSize}` — procs assigned to hotspot callbacks during `loadItfFile`
+  - Entry: `{initProc, unused, drawProc, eventProc, extraSize}` — procs assigned to hotspot callbacks during `loadItfFile`
   - `g_itfControlTypeCount` (0x470164) — bounds check (=7)
-  - `initItfControl` dispatches on controlType: type 4 (text edit buttons) calls `readButtonExtData` to read extra fields from stream
-  - Known types: 1/2/5 have extraSize=0x1C (base only), 3 has 0x20, 4 has 0x54 (text edit)
+  - `initItfControl` dispatches on controlType: type 4 (text edit) calls `readButtonExtData` to read extra fields from stream; types 1/2/5 default `frameCount=5`, type 3 defaults `frameCount=2`
   - `loadItfFile` allocates all controls in one `gameAlloc` call: `num_controls * 0x40 + sum(extraSize)`
+  - **Control types:**
+    - **0 — static** (extraSize=0x24): generic decorated element. No built-in interaction; calling code patches in custom callbacks at +0x5C (draw) and +0x60 (event) after loading. Event handler (`itfControlEventHandler`): delegates to custom event callback if set, otherwise auto-cycles animation frames. Draw: `baseFrame` selects one of 20+ 9-patch skins or special behaviors (5=goal text area, 17=invisible, 18=tiled background, default=text label via `formatUiLabel`)
+    - **1 — pushButton** (extraSize=0x1C): press-and-hold button. Event handler (`itfButtonEventHandler` case 1): captures focus on mouse-down, animates press via `curFrame`, fires (returns 2) on mouse-up over button. Draw: 9-patch skin 0x18 (pressed) / 0x10 (normal) + text label + click sound
+    - **2 — clickButton** (extraSize=0x1C): immediate-action button. Event handler (`itfButtonEventHandler` case 2): fires immediately on click edge (g_leftButton & 2), highlights on hover via `curFrame` cycling, no focus capture. Same draw as type 1
+    - **3 — toggle** (extraSize=0x20): binary on/off with animated transition. Event handler (`itfToggleEventHandler`): flips toggle state at +0x58 on click, animates `curFrame` toward `frameCount-1` (on) or 0 (off), returns 3 when animation complete. 4 extra bytes store the boolean toggle state
+    - **4 — textEdit** (extraSize=0x54): full text input control. Uses `TextEditHotspot` struct. Own draw proc (`drawTextEditControl`): `baseFrame%100` selects background style. Event proc (`handleTextEditInput`): cursor positioning, blink, font switching on focus. Init reads extra fields from stream via `readButtonExtData`
+    - **5 — repeatButton** (extraSize=0x1C): auto-repeat button. Event handler (`itfButtonEventHandler` case 5): increments `curFrame` each tick while held, fires repeatedly after initial delay (when `curFrame >= frameCount`), fires on double-click (g_leftButton & 8). Same draw as types 1/2
+    - **6 — null** (extraSize=0): all dispatch entries NULL. No init, draw, or event handling. Invisible spacer that contributes to bounding box calculation only
+  - **Event handler return values:** 0=not interacting, 1=actively interacting (held/animating/focused), 2=action completed (click/defocus), 3=animation completed (type 3 toggle only)
 - **ItfControlBase** — common 0x1C-byte sub-struct at offset 0x40 in all ITF controls (shared across all types)
-  - `{animHandle, baseFrame, frameCount, curFrame, drawOffsetX, drawOffsetY, _unknown18}`
+  - `{animHandle, baseFrame, frameCount, curFrame, drawOffsetX, drawOffsetY, lastDrawnFrame}`
+  - `baseFrame` field doubles as label/text resource ID when set via `setHotspotLabel` (for controls with no animation)
   - Animation frames: `baseFrame+0`=unfocused, `+1`=focused bg repaint, `+2`=focused text repaint, `+3..n`=cursor blink
   - **NOTE:** struct grouping into ItfControlBase is tentative — we've confirmed the fields and their offsets, but the substruct boundary is inferred from extraSize alignment across types. The grouping may not exactly match the original source
 - **TextEditHotspot** (control type 4) — 0x94-byte struct extending Hotspot for editable text fields
@@ -484,4 +671,20 @@
   - `getCharMetrics(font_handle, ch, out_w, out_h)` — single character width/height from font data
   - `measureStringWidth(font_handle, text)` / `getFontLineHeight(font_handle)` — font-level measurement primitives
   - Static TextCtrl instances: `g_itfTextCtrl` (0x47f8ec, used by `drawItfControl`), `g_descTextCtrl` (0x47e180, used by `descriptionDrawCallback`), `g_categoryTextCtrl` (0x47dfa8, used by `drawCategoryBar`)
+- **9-patch rendering** — `draw9Patch(anim_handle, start_frame, x, y, w, h, fill_color)` draws a resizable bordered rectangle using 8 consecutive animation frames:
+  - Frames +0/+2/+5/+7 = corners (TL/TR/BL/BR), +1/+6 = edges tiled horizontally (top/bottom), +3/+4 = edges tiled vertically (left/right), center filled with `fill_color` (or skipped if -1)
+  - All 9-patch skin indices in ITF controls are multiples of 8 (0x00, 0x08, 0x10, ..., 0x88) — each skin is a group of 8 frames in the interface animation resource (`g_interfaceResources[0]`)
+  - `drawItfControlAnim(hotspot)` — draws a control using its per-control animation (when `animHandle != 0`): blits frame `baseFrame + curFrame` at position + draw offsets
+  - `redrawOverlappingControls(hotspot)` — redraws all controls behind a given control within its clip rect (used when flags & 0x8000)
+  - `drawTiledBackground(skip_playfield)` — tiles a bitmap across the entire surface; if `skip_playfield=1`, skips the playfield rectangle
+- **Goal bar** — displays puzzle goal text at top of screen
+  - `g_goalBarWindow` (0x480fc0, HWND) — goal bar window; NULL → create, else update
+  - `g_goalTextWindow` (0x477938, HWND) — text control within goal bar
+  - `createGoalBar` — reads layout from `timwin.ini` [GoalBar], loads `GOALBAR.ITF`, creates child window
+  - `drawGoalBar` — renders goal bar contents: background fill, icon, formatted goal text
+- **Puzzle dialogs:**
+  - `showPuzzleDisplayDialog` — puzzle intro display (`puzzdisp.itf`), stops/restarts music
+  - `showPuzzleSolvedDialog` — puzzle solved dialog (`puzzsolv.itf`), shown in freeform replay loop
+- `createHotspotEdit(parent, hotspot, initial_text, max_length, flags, style)` → HWND — creates Win32 `"edit"` control overlaid on a hotspot's bounding rect; sends `EM_LIMITTEXT`, flags bit 3 disables hotspot, style 0x200000 adjusts padding
 - **Misc dialogs:** `showMusicBoxDialog` (musicbox.itf)
+- `launchHelp(context_id)` — launches `TIMHELP.EXE` with a context ID (e.g., 4=general, 0xd=programmable ball); unloads sounds, mutes music, tracks `g_helpWindowOpen`
